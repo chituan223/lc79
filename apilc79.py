@@ -33,7 +33,8 @@ latest_data = {
     "Phiên hiện tại": None,
     "Dự đoán": "Đang chờ",
     "Độ tin cậy": 0.0,
-    "ID": "tuananh"
+    "ID": "tuananh",
+    "Đảo cầu": "Không"
 }
 
 # Database học sâu
@@ -42,8 +43,20 @@ streak_stats = {'Tài': [], 'Xỉu': []}
 transition_count = {'TT': 0, 'TX': 0, 'XT': 0, 'XX': 0}
 accuracy_log = []
 
+# Theo dõi đảo cầu
+dao_cau_tracker = {
+    'last_bet': None,           # Lần đặt cuối
+    'last_result': None,        # Kết quả lần trước
+    'streak_loss': 0,           # Chuỗi thua liên tiếp
+    'total_loss': 0,            # Tổng thua
+    'is_dao_cau': False,        # Đang trong chế độ đảo cầu
+    'dao_cau_count': 0,         # Số lần đảo cầu
+    'win_after_dao': 0,         # Thắng sau khi đảo
+    'bet_history': []           # Lịch sử đặt
+}
+
 # ===============================
-# 10 THUẬT TOÁN AI THÔNG MINH
+# 10 THUẬT TOÁN AI THÔNG MINH + ĐẢO CẦU
 # ===============================
 
 class TaiXiuAI:
@@ -106,7 +119,6 @@ class TaiXiuAI:
         if len(data) < 5:
             return None, 0, "Không đủ dữ liệu"
         
-        # Cập nhật ma trận
         for i in range(len(data) - 1):
             curr = 'T' if data[i] == 'Tài' else 'X'
             next_val = 'T' if data[i+1] == 'Tài' else 'X'
@@ -144,7 +156,6 @@ class TaiXiuAI:
             else:
                 break
         
-        # Thu thập thống kê chuỗi
         all_streaks = []
         curr_streak = 1
         curr_type = data[0]
@@ -343,13 +354,11 @@ class TaiXiuAI:
         alternating = all(recent[i] != recent[i+1] for i in range(5))
         
         if alternating:
-            # Đang T-X-T-X-T-X, khả năng cao phá vỡ hoặc tiếp tục
             if data[-2] == data[-1]:
                 return data[-1], 65, "Pattern T-X đồng nhất"
             else:
                 return 'Xỉu' if data[-1] == 'Tài' else 'Tài', 60, "Pattern T-X chuẩn"
         
-        # Kiểm tra gần alternating
         switches = sum(1 for i in range(len(recent)-1) if recent[i] != recent[i+1])
         if switches >= 4:
             return recent[-1], 55, "Gần alternating"
@@ -363,7 +372,6 @@ class TaiXiuAI:
         
         log_odds = 0
         
-        # Evidence 1: Ngắn hạn
         r5 = data[-5:]
         t5 = r5.count('Tài') / 5
         if t5 > 0.7:
@@ -371,13 +379,11 @@ class TaiXiuAI:
         elif t5 < 0.3:
             log_odds += 0.6
         
-        # Evidence 2: Trung hạn
         if len(data) >= 15:
             r15 = data[-15:]
             t15 = r15.count('Tài') / 15
             log_odds -= (t15 - 0.5) * 1.5
         
-        # Evidence 3: Chuỗi
         last = data[-1]
         streak = 1
         for i in range(len(data)-2, -1, -1):
@@ -446,7 +452,6 @@ class TaiXiuAI:
         margin = abs(t_ratio - 0.5)
         conf = 50 + margin * 100
         
-        # Điều chỉnh theo số AI đồng thuận
         same = [d for d in details if d['prediction'] == final]
         conf += len(same) * 2
         conf = min(conf, 95)
@@ -454,6 +459,92 @@ class TaiXiuAI:
         reason = f"{len(same)} AI đồng thuận" if same else "Tổng hợp"
         
         return final, round(conf, 1), reason, details
+
+
+# ===============================
+# HỆ THỐNG ĐẢO CẦU THÔNG MINH
+# ===============================
+
+def check_dao_cau(ai_prediction: str, ket_qua: str) -> Tuple[str, str]:
+    """
+    Kiểm tra và thực hiện đảo cầu
+    Trả về: (quyet_dinh, ly_do)
+    """
+    global dao_cau_tracker
+    
+    # Cập nhật kết quả lần trước
+    if dao_cau_tracker['last_bet'] is not None:
+        win = (dao_cau_tracker['last_bet'] == ket_qua)
+        dao_cau_tracker['bet_history'].append({
+            'bet': dao_cau_tracker['last_bet'],
+            'result': ket_qua,
+            'win': win,
+            'dao_cau': dao_cau_tracker['is_dao_cau']
+        })
+        
+        if not win:
+            dao_cau_tracker['streak_loss'] += 1
+            dao_cau_tracker['total_loss'] += 1
+        else:
+            if dao_cau_tracker['is_dao_cau']:
+                dao_cau_tracker['win_after_dao'] += 1
+            dao_cau_tracker['streak_loss'] = 0
+            dao_cau_tracker['is_dao_cau'] = False
+    
+    # QUY TẮC ĐẢO CẦU
+    quyet_dinh = ai_prediction
+    ly_do = "Theo AI"
+    is_dao = False
+    
+    # Rule 1: Thua 3 lần liên tiếp -> Đảo cầu
+    if dao_cau_tracker['streak_loss'] >= 3:
+        quyet_dinh = 'Xỉu' if ai_prediction == 'Tài' else 'Tài'
+        ly_do = f"Đảo cầu (thua {dao_cau_tracker['streak_loss']} lần)"
+        is_dao = True
+    
+    # Rule 2: Thua 2 lần + AI confidence thấp (< 60) -> Đảo
+    elif dao_cau_tracker['streak_loss'] == 2:
+        # Lấy confidence từ lần dự đoán trước (cần truyền vào)
+        quyet_dinh = 'Xỉu' if ai_prediction == 'Tài' else 'Tài'
+        ly_do = "Đảo cầu (thua 2 + nghi ngờ)"
+        is_dao = True
+    
+    # Rule 3: Pattern thua cụ thể: Tài-Xỉu-Tài-Xỉu thua liên tiếp
+    elif len(dao_cau_tracker['bet_history']) >= 4:
+        recent = dao_cau_tracker['bet_history'][-4:]
+        if all(not r['win'] for r in recent):
+            quyet_dinh = 'Xỉu' if ai_prediction == 'Tài' else 'Tài'
+            ly_do = "Đảo cầu (thua 4 phiên liên tiếp)"
+            is_dao = True
+    
+    # Cập nhật trạng thái
+    dao_cau_tracker['last_bet'] = quyet_dinh
+    dao_cau_tracker['is_dao_cau'] = is_dao
+    if is_dao:
+        dao_cau_tracker['dao_cau_count'] += 1
+    
+    return quyet_dinh, ly_do
+
+
+def get_dao_cau_stats() -> dict:
+    """Thống kê đảo cầu"""
+    total_bets = len(dao_cau_tracker['bet_history'])
+    if total_bets == 0:
+        return {'status': 'Chưa có dữ liệu'}
+    
+    wins = sum(1 for b in dao_cau_tracker['bet_history'] if b['win'])
+    dao_wins = sum(1 for b in dao_cau_tracker['bet_history'] if b['win'] and b['dao_cau'])
+    
+    return {
+        'tong_phien': total_bets,
+        'thang': wins,
+        'thua': total_bets - wins,
+        'ty_le_thang': round(wins/total_bets*100, 1),
+        'so_lan_dao_cau': dao_cau_tracker['dao_cau_count'],
+        'thang_sau_dao': dao_wins,
+        'ty_le_dao_thanh_cong': round(dao_wins/max(dao_cau_tracker['dao_cau_count'],1)*100, 1),
+        'chuoi_thua_hien_tai': dao_cau_tracker['streak_loss']
+    }
 
 
 # Khởi tạo AI
@@ -468,9 +559,10 @@ def fetch_data_loop():
 
     last_prediction = None
     last_conf = 0
+    last_ai_pred = None
 
     print("=" * 70)
-    print("🧠 SUPER AI TÀI XỈU - 10 THUẬT TOÁN SIÊU TỐI ƯU")
+    print("🧠 SUPER AI TÀI XỈU - 10 THUẬT TOÁN + ĐẢO CẦU THÔNG MINH")
     print("=" * 70)
     print("⏳ Đang chờ dữ liệu từ API...")
     print("-" * 70)
@@ -513,44 +605,66 @@ def fetch_data_loop():
                 history.pop(0)
                 history_details.pop(0)
 
-            # Kiểm tra dự đoán cũ
+            # Kiểm tra dự đoán cũ và đảo cầu
             if last_prediction and ket_qua in ['Tài', 'Xỉu']:
                 correct = (last_prediction == ket_qua)
                 accuracy_log.append(correct)
                 status = "✅ ĐÚNG" if correct else "❌ SAI"
                 acc_20 = sum(accuracy_log[-20:]) / min(len(accuracy_log), 20) * 100 if accuracy_log else 0
                 
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 📊 PHIÊN {phien_id}")
+                # Kiểm tra có phải đảo cầu không
+                dao_status = " [ĐẢO CẦU]" if dao_cau_tracker['is_dao_cau'] else ""
+                
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 📊 PHIÊN {phien_id}{dao_status}")
                 print(f"    🎲 Xúc xắc: {d1}-{d2}-{d3} = {tong} điểm → [{ket_qua}]")
-                print(f"    🎯 Dự đoán trước: {last_prediction} ({last_conf}%) → {status}")
-                print(f"    📈 Độ chính xác 20 phiên: {acc_20:.1f}%")
+                print(f"    🎯 Dự đoán: {last_prediction} ({last_conf}%) → {status}")
+                
+                if not correct:
+                    print(f"    ⚠️  Chuỗi thua: {dao_cau_tracker['streak_loss']} lần")
+                
+                # Stats đảo cầu
+                dao_stats = get_dao_cau_stats()
+                if 'ty_le_thang' in dao_stats:
+                    print(f"    📈 Tỷ lệ thắng: {dao_stats['ty_le_thang']}% | Đảo cầu: {dao_stats['so_lan_dao_cau']} lần")
             else:
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🆕 PHIÊN MỚI {phien_id}")
                 print(f"    🎲 Xúc xắc: {d1}-{d2}-{d3} = {tong} điểm → [{ket_qua}]")
 
             # Dự đoán mới
             if len(history) >= MIN_PHIEN_PREDICT:
-                du_doan, do_tin_cay, ly_do, chi_tiet = ai_engine.predict(history)
-                last_prediction = du_doan if du_doan in ['Tài', 'Xỉu'] else None
-                last_conf = do_tin_cay
+                # AI dự đoán
+                du_doan_ai, do_tin_cay, ly_do_ai, chi_tiet = ai_engine.predict(history)
+                last_ai_pred = du_doan_ai if du_doan_ai in ['Tài', 'Xỉu'] else None
                 
-                # Kiểm tra đảo cầu
-                pattern_str = ''.join(['T' if x == 'Tài' else 'X' for x in history[-10:]])
-                
-                print(f"    🔮 DỰ ĐOÁN TIẾP THEO: {du_doan} (độ tin: {do_tin_cay}%)")
-                print(f"       Lý do: {ly_do}")
-                print(f"       Pattern 10: {pattern_str}")
-                
-                if chi_tiet:
-                    top3 = sorted(chi_tiet, key=lambda x: x['confidence'], reverse=True)[:3]
-                    print(f"       Top AI: " + " | ".join([f"{t['name']}({t['confidence']:.0f}%)" for t in top3]))
+                # Áp dụng đảo cầu
+                if last_ai_pred:
+                    quyet_dinh, ly_do_dao = check_dao_cau(last_ai_pred, ket_qua)
+                    last_prediction = quyet_dinh
+                    last_conf = do_tin_cay
+                    
+                    # Hiển thị
+                    is_dao = (quyet_dinh != last_ai_pred)
+                    dao_str = " 🔄[ĐẢO]" if is_dao else ""
+                    
+                    print(f"    🔮 AI gốc: {last_ai_pred} ({do_tin_cay}%) - {ly_do_ai}")
+                    print(f"    ⭐ QUYẾT ĐỊNH: {quyet_dinh}{dao_str} - {ly_do_dao}")
+                    
+                    pattern_str = ''.join(['T' if x == 'Tài' else 'X' for x in history[-10:]])
+                    print(f"       Pattern: {pattern_str}")
+                    
+                    if chi_tiet:
+                        top3 = sorted(chi_tiet, key=lambda x: x['confidence'], reverse=True)[:3]
+                        print(f"       Top AI: " + " | ".join([f"{t['name']}({t['confidence']:.0f}%)" for t in top3]))
+                else:
+                    last_prediction = None
             else:
                 print(f"    ⏳ Chờ thêm {MIN_PHIEN_PREDICT - len(history)} phiên...")
                 last_prediction = None
             
-            
+            print("-" * 70)
 
             # Cập nhật JSON
+            dao_info = get_dao_cau_stats()
             latest_data.update({
                 "Phiên": phien_id,
                 "Xúc xắc 1": d1,
@@ -561,7 +675,9 @@ def fetch_data_loop():
                 "Phiên hiện tại": phien_id,
                 "Dự đoán": last_prediction if last_prediction else "Chờ",
                 "Độ tin cậy": last_conf,
-                "ID": "tuananh"
+                "ID": "tuananh",
+                "Đảo cầu": "Có" if dao_cau_tracker['is_dao_cau'] else "Không",
+                "Thống kê đảo cầu": dao_info
             })
 
         except Exception as e:
@@ -593,8 +709,27 @@ def api_history():
             "total": len(accuracy_log),
             "correct": sum(accuracy_log),
             "rate": round(sum(accuracy_log) / len(accuracy_log) * 100, 2) if accuracy_log else 0
-        }
+        },
+        "dao_cau": get_dao_cau_stats(),
+        "bet_history": dao_cau_tracker['bet_history'][-20:]
     })
+
+
+@app.route("/api/dao-cau/reset", methods=["POST"])
+def reset_dao_cau():
+    """Reset trạng thái đảo cầu"""
+    global dao_cau_tracker
+    dao_cau_tracker = {
+        'last_bet': None,
+        'last_result': None,
+        'streak_loss': 0,
+        'total_loss': 0,
+        'is_dao_cau': False,
+        'dao_cau_count': 0,
+        'win_after_dao': 0,
+        'bet_history': []
+    }
+    return jsonify({"status": "Đã reset đảo cầu"})
 
 
 # ===============================
