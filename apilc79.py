@@ -34,32 +34,41 @@ accuracy_tracker = {'correct': 0, 'total': 0, 'tai_correct': 0, 'xiu_correct': 0
 # 20 THUẬT TOÁN AI CÔNG BẰNG
 # ===============================
 
-self.weights = {
-    'pattern_20': 0.08,
-    'ngram_5': 0.07,
-    'ngram_7': 0.07,
-    'markov_2': 0.06,
-    'markov_3': 0.06,
-    'streak': 0.06,
-    'freq_5': 0.05,
-    'freq_10': 0.05,
-    'freq_20': 0.05,
-    'freq_50': 0.05,
-    'entropy_15': 0.05,
-    'entropy_30': 0.05,
-    'cycle': 0.05,
-    'sequence': 0.05,
-    'momentum': 0.05,
-    'trend': 0.05,
-    'alternating': 0.05,
-    'bayesian': 0.05,
-    'golden': 0.04,
-    'chaos': 0.04,
-    'balance_guard': 0.08
-}
-    
+class BalancedAI:
+    def __init__(self):
+        raw_weights = {
+            'pattern_20': 0.08,
+            'ngram_5': 0.07,
+            'ngram_7': 0.07,
+            'markov_2': 0.06,
+            'markov_3': 0.06,
+            'streak_deep': 0.06,
+            'frequency_5': 0.05,
+            'frequency_10': 0.05,
+            'frequency_20': 0.05,
+            'frequency_50': 0.05,
+            'entropy_15': 0.05,
+            'entropy_30': 0.05,
+            'cycle_detect': 0.05,
+            'sequence_match': 0.05,
+            'momentum': 0.05,
+            'trend_analysis': 0.05,
+            'alternating': 0.05,
+            'bayesian': 0.05,
+            'golden_ratio': 0.04,
+            'chaos_theory': 0.04,
+            'balance_guard': 0.08
+        }
+
+        # Normalize để tổng = 1
+        total = sum(raw_weights.values())
+        self.weights = {k: v / total for k, v in raw_weights.items()}
+
     def to_tx(self, result: str) -> str:
         return 'T' if result == 'Tài' else 'X'
+
+    def to_full(self, tx: str) -> str:
+        return 'Tài' if tx == 'T' else 'Xỉu'
     
     def check_bias(self, data: List[str]) -> float:
         """Kiểm tra độ lệch của dữ liệu"""
@@ -498,7 +507,7 @@ self.weights = {
         
         algorithms = [
             ('Pattern 20', self.algo_pattern_20),
-            ('N-Gram 5', lambda d: self.algo_ngram(d, 5)),
+         ('N-Gram 5', lambda d: self.algo_ngram(d, 5)),
             ('N-Gram 7', lambda d: self.algo_ngram(d, 7)),
             ('Markov 2', lambda d: self.algo_markov(d, 2)),
             ('Markov 3', lambda d: self.algo_markov(d, 3)),
@@ -519,44 +528,91 @@ self.weights = {
             ('Chaos', self.algo_chaos)
         ]
         
-        votes = {'Tài': 0.0, 'Xỉu': 0.0}
-        details = []
         
-        for name, algo in algorithms:
-            try:
-                result, conf, reason = algo(data)
-                if result and conf >= 55:  # Ngưỡng cao hơn
-                    weight = self.weights[name.lower().replace(' ', '_')]
-                    vote_power = weight * (conf / 100)
-                    votes[result] += vote_power
-                    
-                    details.append({
-                        'name': name,
-                        'prediction': result,
-                        'confidence': round(conf, 1),
-                        'weight': weight,
-                        'vote': round(vote_power, 3),
-                        'reason': reason
-                    })
-            except:
-                continue
+        # phần này nằm trong class BalancedAI
+
+def predict(self, data):
+    votes = {'Tài': 0.0, 'Xỉu': 0.0}
+    details = []
+
+    # ===== chạy các algo trước đó để fill votes + details =====
+    for name, algo in self.algorithms:
+        try:
+            result, conf, reason = algo(data)
+
+            if result and conf is not None and conf >= 55:
+                key = name.lower().replace(' ', '_').replace('-', '_')
+                weight = self.weights.get(key, 0)
+
+                vote_power = weight * (conf / 100)
+                votes[result] += vote_power
+
+                details.append({
+                    'name': name,
+                    'prediction': result,
+                    'confidence': round(conf, 1),
+                    'weight': weight,
+                    'vote': round(vote_power, 3),
+                    'reason': reason
+                })
+
+        except Exception as e:
+            print(f"Lỗi ở {name}: {e}")
+            continue
+
+    # ===== pattern 20 =====
+    pattern_20 = ''.join([self.to_tx(x) for x in data[-20:]])
+
+    # ===== guard =====
+    total_votes = votes['Tài'] + votes['Xỉu']
+
+    if total_votes == 0:
+        guard_pred, guard_conf, guard_reason = self.balance_guard(data, None)
+
+        if guard_pred in ['Tài', 'Xỉu']:
+            return guard_pred, guard_conf, guard_reason, [], pattern_20
+
+        return "Không chắc chắn", 0, "Không đủ tín hiệu", [], pattern_20
+
+    # ===== tính kết quả =====
+    t_ratio = votes['Tài'] / total_votes
+    final = 'Tài' if t_ratio > 0.5 else 'Xỉu'
+    margin = abs(t_ratio - 0.5)
+
+    # ===== balance guard =====
+    guard_pred, guard_conf, guard_reason = self.balance_guard(data, final)
+
+    if guard_pred in ['Tài', 'Xỉu'] and margin < 0.15:
+        final = guard_pred
+        reason = guard_reason
+        conf = guard_conf
+    else:
+        base_conf = 50 + margin * 100
+        active = len([d for d in details if d['prediction'] == final])
+        conf = min(base_conf + active * 1.5, 95)
+
+        same = [d for d in details if d['prediction'] == final]
+        if same:
+            top = max(same, key=lambda x: x['vote'])
+            reason = f"{top['name']} mạnh, {active}/20 đồng ý"
+        else:
+            reason = "Tổng hợp"
+
+    return final, round(conf, 1), reason, details, pattern_20
         
-        pattern_20 = ''.join([self.to_tx(x) for x in data[-20:]])
-        
-        # Kiểm tra bảo vệ cân bằng
+       
+    def predict(self, data):   # ✅ indent 4 spaces trong class
         total_votes = votes['Tài'] + votes['Xỉu']
-        
-        if total_votes == 0:
-            # Không có AI nào dự đoán -> dùng balance guard
-            guard_pred, guard_conf, guard_reason = self.balance_guard(data, None)
-            if guard_pred:
-                return guard_pred, guard_conf, guard_reason, [], pattern_20
-            return "Không chắc chắn", 0, "Không đủ tín hiệu", [], pattern_20
-        
-        # Tính kết quả
-        t_ratio = votes['Tài'] / total_votes
+
+        if total_votes > 0:
+            t_ratio = votes['Tài'] / total_votes
+        else:
+            t_ratio = 0.5
+
         final = 'Tài' if t_ratio > 0.5 else 'Xỉu'
         margin = abs(t_ratio - 0.5)
+
+        return final, margin
         
         # Kiểm tra cân bằng
         guard_pred, guard_conf, guard_reason = self.balance_guard(data, final)
@@ -595,11 +651,7 @@ def fetch_data_loop():
     last_prediction = None
     last_conf = 0
 
-    print("=" * 80)
-    print("🧠 BALANCED AI - 20 THUẬT TOÁN CÔNG BẰNG")
-    print("=" * 80)
-    print("⏳ Đang chờ dữ liệu từ API...")
-    print("-" * 80)
+    
 
     while True:
         try:
@@ -657,16 +709,7 @@ def fetch_data_loop():
                 # Kiểm tra bias
                 tai_rate = history.count('Tài') / len(history) if history else 0.5
                 
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 📊 PHIÊN {phien_id}")
-                print(f"    🎲 Xúc xắc: [{d1}] [{d2}] [{d3}] = {tong} điểm → [{ket_qua}]")
-                print(f"    🎯 Dự đoán trước: {last_prediction} ({last_conf}%) → {status}")
-                print(f"    📈 Tỷ lệ chính xác: {acc_rate:.1f}% | Tài/Xỉu trong lịch sử: {tai_rate:.1%}/{1-tai_rate:.1%}")
                 
-                if bias_tracker['Tài'] > 0 or bias_tracker['Xỉu'] > 0:
-                    print(f"    ⚠️  Cân bằng đã can thiệp: T{bias_tracker['Tài']}/X{bias_tracker['Xỉu']} lần")
-            else:
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🆕 PHIÊN MỚI {phien_id}")
-                print(f"    🎲 Xúc xắc: [{d1}] [{d2}] [{d3}] = {tong} điểm → [{ket_qua}]")
 
             # Dự đoán mới
             du_doan, do_tin_cay, ly_do, chi_tiet, pattern_20 = balanced_ai.predict(history)
@@ -677,24 +720,8 @@ def fetch_data_loop():
             else:
                 last_prediction = None
 
-            # Hiển thị
-            print(f"    🔮 DỰ ĐOÁN PHIÊN TIẾP THEO: {du_doan}")
-            print(f"       Độ tin cậy: {do_tin_cay}%")
-            print(f"       Lý do: {ly_do}")
-            print(f"       Pattern 20: {pattern_20}")
             
-            if chi_tiet:
-                # Hiển thị phân bố T/X
-                tai_votes = sum(1 for d in chi_tiet if d['prediction'] == 'Tài')
-                xiu_votes = sum(1 for d in chi_tiet if d['prediction'] == 'Xỉu')
-                print(f"       Phân bố AI: Tài({tai_votes}) vs Xỉu({xiu_votes})")
-                
-                top3 = sorted(chi_tiet, key=lambda x: x['vote'], reverse=True)[:3]
-                print(f"       Top 3: " + " | ".join([f"{t['name']}({t['confidence']:.0f}%)" for t in top3]))
             
-            print("-" * 80)
-
-            # Cập nhật JSON
             latest_data = {
                 "phiên": phien_id,
                 "xúc_xắc_1": d1,
@@ -702,14 +729,9 @@ def fetch_data_loop():
                 "xúc_xắc_3": d3,
                 "tổng": tong,
                 "kết": ket_qua,
-                "phiên_hiện_tại": phien_id,
                 "dự_đoán": du_doan if du_doan in ['Tài', 'Xỉu'] else "Chờ",
-                "pattern_20": pattern_20,
+                "pattern": pattern_20,
                 "độ_tin_cậy": do_tin_cay,
-                "lý_do": ly_do,
-                "số_ai_hoạt_động": len(chi_tiet),
-                "phân_bố_ai": f"Tài({sum(1 for d in chi_tiet if d['prediction'] == 'Tài')})-Xỉu({sum(1 for d in chi_tiet if d['prediction'] == 'Xỉu')})" if chi_tiet else "0-0",
-                "cân_bằng_can_thiệp": bias_tracker['Tài'] + bias_tracker['Xỉu'],
                 "id": "tuananh"
             }
 
@@ -757,12 +779,7 @@ def api_history():
     })
 
 
-@app.route("/api/reset-bias", methods=["POST"])
-def reset_bias():
-    """Reset bộ đếm bias"""
-    global bias_tracker
-    bias_tracker = {'Tài': 0, 'Xỉu': 0, 'corrections': 0}
-    return jsonify({"status": "Đã reset cân bằng"})
+
 
 
 # ===============================
