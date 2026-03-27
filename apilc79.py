@@ -34,32 +34,29 @@ accuracy_tracker = {'correct': 0, 'total': 0, 'tai_correct': 0, 'xiu_correct': 0
 # 20 THUẬT TOÁN AI CÔNG BẰNG
 # ===============================
 
-class BalancedAI:
-    def __init__(self):
-        # Trọng số cân bằng, không thiên lệch
-        self.weights = {
-            'pattern_20': 0.08,
-            'ngram_5': 0.07,
-            'ngram_7': 0.07,
-            'markov_2': 0.06,
-            'markov_3': 0.06,
-            'streak_deep': 0.06,
-            'frequency_5': 0.05,
-            'frequency_10': 0.05,
-            'frequency_20': 0.05,
-            'frequency_50': 0.05,
-            'entropy_15': 0.05,
-            'entropy_30': 0.05,
-            'cycle_detect': 0.05,
-            'sequence_match': 0.05,
-            'momentum': 0.05,
-            'trend_analysis': 0.05,
-            'alternating': 0.05,
-            'bayesian': 0.05,
-            'golden_ratio': 0.04,
-            'chaos_theory': 0.04,
-            'balance_guard': 0.08  # Thêm bảo vệ cân bằng
-        }
+self.weights = {
+    'pattern_20': 0.08,
+    'ngram_5': 0.07,
+    'ngram_7': 0.07,
+    'markov_2': 0.06,
+    'markov_3': 0.06,
+    'streak': 0.06,
+    'freq_5': 0.05,
+    'freq_10': 0.05,
+    'freq_20': 0.05,
+    'freq_50': 0.05,
+    'entropy_15': 0.05,
+    'entropy_30': 0.05,
+    'cycle': 0.05,
+    'sequence': 0.05,
+    'momentum': 0.05,
+    'trend': 0.05,
+    'alternating': 0.05,
+    'bayesian': 0.05,
+    'golden': 0.04,
+    'chaos': 0.04,
+    'balance_guard': 0.08
+}
     
     def to_tx(self, result: str) -> str:
         return 'T' if result == 'Tài' else 'X'
