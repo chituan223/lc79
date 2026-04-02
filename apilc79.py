@@ -1,742 +1,325 @@
 import requests
 import time
 import threading
-import statistics
 import math
 from flask import Flask, jsonify
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict
 
 # ===============================
 # CẤU HÌNH
 # ===============================
-API_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-last_processed_session_id = None
+API_URL    = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
+MIN_PHIEN  = 20
+MAX_PHIEN  = 200
 
 app = Flask(__name__)
 
 # ===============================
-# DỮ LIỆU TOÀN CỤC
+# DỮ LIỆU (GIỮ NGUYÊN JSON GỐC)
 # ===============================
-history = []
-history_details = []
-MAX_HISTORY = 200
-MIN_PHIEN_PREDICT = 20
+latest_data = {
+    "Phiên":          None,
+    "Xúc xắc 1":      None,
+    "Xúc xắc 2":      None,
+    "Xúc xắc 3":      None,
+    "Tổng":           None,
+    "Kết":            None,
+    "Phiên hiện tại": None,
+    "Dự đoán":        "Đang chờ",
+    "Độ tin cậy":     0.0,
+    "ID":             "tuananh"
+}
 
-latest_data = {}
-
-# Theo dõi bias
-bias_tracker = {'Tài': 0, 'Xỉu': 0, 'corrections': 0}
-accuracy_tracker = {'correct': 0, 'total': 0, 'tai_correct': 0, 'xiu_correct': 0}
+last_processed_session_id = None
 
 # ===============================
-# 20 THUẬT TOÁN AI CÔNG BẰNG
+# LỊCH SỬ
+# ===============================
+history  = deque(maxlen=MAX_PHIEN)
+hist_pt  = deque(maxlen=MAX_PHIEN)
+
+# ===============================
+# AI ENGINE
 # ===============================
 
-class BalancedAI:
-    def __init__(self):
-        raw_weights = {
-            'pattern_20': 0.08,
-            'ngram_5': 0.07,
-            'ngram_7': 0.07,
-            'markov_2': 0.06,
-            'markov_3': 0.06,
-            'streak_deep': 0.06,
-            'frequency_5': 0.05,
-            'frequency_10': 0.05,
-            'frequency_20': 0.05,
-            'frequency_50': 0.05,
-            'entropy_15': 0.05,
-            'entropy_30': 0.05,
-            'cycle_detect': 0.05,
-            'sequence_match': 0.05,
-            'momentum': 0.05,
-            'trend_analysis': 0.05,
-            'alternating': 0.05,
-            'bayesian': 0.05,
-            'golden_ratio': 0.04,
-            'chaos_theory': 0.04,
-            'balance_guard': 0.08
-        }
+_t1 = defaultdict(lambda: {"Tài":0,"Xỉu":0})
+_t2 = defaultdict(lambda: {"Tài":0,"Xỉu":0})
+_t3 = defaultdict(lambda: {"Tài":0,"Xỉu":0})
+_t4 = defaultdict(lambda: {"Tài":0,"Xỉu":0})
+_t5 = defaultdict(lambda: {"Tài":0,"Xỉu":0})
+_ng = defaultdict(lambda: {"Tài":0,"Xỉu":0})
+_sd = {"Tài": defaultdict(int), "Xỉu": defaultdict(int)}
+_acc = {k: {"ok":0,"n":0} for k in ("m1","m2","m3","m4","m5","ng","sk","pt","fr10","fr20","mom","rep")}
+_prev_model = {}
+_prev_pred  = None
+stats = {"tong":0,"dung":0,"sai":0,"cd":0,"cs":0,"max_cd":0,"max_cs":0}
 
-        # Normalize để tổng = 1
-        total = sum(raw_weights.values())
-        self.weights = {k: v / total for k, v in raw_weights.items()}
 
-    def to_tx(self, result: str) -> str:
-        return 'T' if result == 'Tài' else 'X'
+def _train_markov():
+    for tb in (_t1,_t2,_t3,_t4,_t5):
+        for d in tb.values(): d.update({"Tài":0,"Xỉu":0})
+    h = list(history)
+    for i in range(len(h)-1): _t1[h[i]][h[i+1]] += 1
+    for i in range(len(h)-2): _t2[h[i]+"|"+h[i+1]][h[i+2]] += 1
+    for i in range(len(h)-3): _t3[h[i]+"|"+h[i+1]+"|"+h[i+2]][h[i+3]] += 1
+    for i in range(len(h)-4): _t4[h[i]+"|"+h[i+1]+"|"+h[i+2]+"|"+h[i+3]][h[i+4]] += 1
+    for i in range(len(h)-5): _t5["|".join(h[i:i+5])][h[i+5]] += 1
 
-    def to_full(self, tx: str) -> str:
-        return 'Tài' if tx == 'T' else 'Xỉu'
-    
-    def check_bias(self, data: List[str]) -> float:
-        """Kiểm tra độ lệch của dữ liệu"""
-        if len(data) < 20:
-            return 0.0
-        t_ratio = data.count('Tài') / len(data)
-        return t_ratio - 0.5  # >0 lệch Tài, <0 lệch Xỉu
-    
-    # ========== THUẬT TOÁN 1: PATTERN 20 CÂN BẰNG ==========
-    def algo_pattern_20(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 21:
-            return None, 0, "Không đủ dữ liệu"
-        
-        current_20 = ''.join([self.to_tx(x) for x in data[-20:]])
-        
-        # Đếm T và X trong pattern hiện tại
-        t_count = current_20.count('T')
-        x_count = current_20.count('X')
-        
-        # Nếu đã lệch quá nhiều -> đảo
-        if t_count >= 14:  # 70% T
-            return 'Xỉu', 70, f"Pattern 20 lệch T ({t_count}/20)"
-        if x_count >= 14:  # 70% X
-            return 'Tài', 70, f"Pattern 20 lệch X ({x_count}/20)"
-        
-        # Tìm pattern tương tự trong lịch sử
-        matches = {'T': 0, 'X': 0, 'total': 0}
-        for i in range(len(data) - 21):
-            past_20 = ''.join([self.to_tx(x) for x in data[i:i+20]])
-            if past_20 == current_20:
-                next_val = data[i+20]
-                matches[self.to_tx(next_val)] += 1
-                matches['total'] += 1
-        
-        if matches['total'] >= 2:
-            t_prob = matches['T'] / matches['total']
-            # Chỉ dự đoán nếu chênh lệch rõ ràng
-            if t_prob > 0.6:
-                return 'Tài', 60, f"Pattern 20 khớp T ({matches['total']} lần)"
-            elif t_prob < 0.4:
-                return 'Xỉu', 60, f"Pattern 20 khớp X ({matches['total']} lần)"
-        
-        return None, 0, "Pattern 20 trung lập"
-    
-    # ========== THUẬT TOÁN 2-3: N-GRAM CÂN BẰNG ==========
-    def algo_ngram(self, data: List[str], n: int) -> Tuple[Optional[str], float, str]:
-        if len(data) < n + 1:
-            return None, 0, f"Không đủ N-{n}"
-        
-        current = tuple(data[-n:])
-        matches = {'T': 0, 'X': 0, 'total': 0}
-        
-        for i in range(len(data) - n - 1):
-            if tuple(data[i:i+n]) == current:
-                next_val = 'T' if data[i+n] == 'Tài' else 'X'
-                matches[next_val] += 1
-                matches['total'] += 1
-        
-        if matches['total'] >= 3:
-            t_prob = matches['T'] / matches['total']
-            # Ngưỡng cao hơn để tránh dự đoán lung tung
-            if t_prob > 0.65:
-                return 'Tài', 65, f"N-{n}: T mạnh"
-            elif t_prob < 0.35:
-                return 'Xỉu', 65, f"N-{n}: X mạnh"
-        
-        return None, 0, f"N-{n} không rõ"
-    
-    # ========== THUẬT TOÁN 4-5: MARKOV CÂN BẰNG ==========
-    def algo_markov(self, data: List[str], order: int) -> Tuple[Optional[str], float, str]:
-        if len(data) < order + 1:
-            return None, 0, f"Không đủ Markov-{order}"
-        
-        # Xây dựng ma trận
-        transitions = defaultdict(lambda: {'T': 0, 'X': 0})
-        
-        for i in range(len(data) - order):
-            key = ''.join([self.to_tx(data[i+j]) for j in range(order)])
-            next_val = self.to_tx(data[i+order])
-            transitions[key][next_val] += 1
-        
-        current_key = ''.join([self.to_tx(data[-order+j]) for j in range(order)])
-        
-        if current_key not in transitions:
-            return None, 0, f"Chưa thấy Markov-{order} này"
-        
-        trans = transitions[current_key]
-        total = trans['T'] + trans['X']
-        
-        if total < 5:
-            return None, 0, f"Markov-{order} ít mẫu"
-        
-        t_prob = trans['T'] / total
-        
-        # Ngưỡng chặt chẽ hơn
-        if t_prob > 0.7:
-            return 'Tài', 65, f"Markov-{order}: T"
-        elif t_prob < 0.3:
-            return 'Xỉu', 65, f"Markov-{order}: X"
-        
-        return None, 0, f"Markov-{order} cân bằng"
-    
-    # ========== THUẬT TOÁN 6: STREAK CÂN BẰNG ==========
-    def algo_streak(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 15:
-            return None, 0, "Không đủ dữ liệu"
-        
-        last = data[-1]
-        current_streak = 1
-        for i in range(len(data)-2, -1, -1):
-            if data[i] == last:
-                current_streak += 1
-            else:
-                break
-        
-        # Thu thập chuỗi
-        all_streaks = []
-        curr_type = data[0]
-        curr_count = 1
-        
-        for i in range(1, len(data)):
-            if data[i] == curr_type:
-                curr_count += 1
-            else:
-                all_streaks.append((curr_type, curr_count))
-                curr_type = data[i]
-                curr_count = 1
-        all_streaks.append((curr_type, curr_count))
-        
-        same_type = [s[1] for s in all_streaks if s[0] == last]
-        if not same_type:
-            return None, 0, "Không có dữ liệu chuỗi"
-        
-        avg = statistics.mean(same_type)
-        max_s = max(same_type)
-        
-        # Chỉ đảo khi chuỗi thực sự dài
-        if current_streak >= 5:  # Chuỗi 5+ mới đảo
-            return 'Xỉu' if last == 'Tài' else 'Tài', 75, f"Chuỗi {current_streak} rất dài"
-        elif current_streak == 4 and current_streak >= max_s - 1:
-            return 'Xỉu' if last == 'Tài' else 'Tài', 65, f"Chuỗi 4 gần max"
-        
-        return None, 0, f"Chuỗi {current_streak} bình thường"
-    
-    # ========== THUẬT TOÁN 7-10: FREQUENCY CÂN BẰNG ==========
-    def algo_frequency(self, data: List[str], window: int) -> Tuple[Optional[str], float, str]:
-        if len(data) < window:
-            return None, 0, f"Không đủ {window} phiên"
-        
-        recent = data[-window:]
-        t_ratio = recent.count('Tài') / window
-        
-        # Ngưỡng cao hơn, không nhạy cảm
-        if t_ratio > 0.75:  # 75% mới đảo
-            return 'Xỉu', 70, f"Freq-{window}: T quá nhiều ({t_ratio:.0%})"
-        elif t_ratio < 0.25:
-            return 'Tài', 70, f"Freq-{window}: X quá nhiều ({t_ratio:.0%})"
-        
-        return None, 0, f"Freq-{window} cân bằng"
-    
-    # ========== THUẬT TOÁN 11-12: ENTROPY CÂN BẰNG ==========
-    def algo_entropy(self, data: List[str], window: int) -> Tuple[Optional[str], float, str]:
-        if len(data) < window + 5:
-            return None, 0, f"Không đủ entropy-{window}"
-        
-        recent = data[-window:]
-        switches = sum(1 for i in range(len(recent)-1) if recent[i] != recent[i+1])
-        entropy = switches / (window - 1)
-        
-        # Entropy thấp = chuỗi dài -> tiếp tục
-        if entropy < 0.15:  # Rất thấp
-            return recent[-1], 70, f"Entropy-{window} rất thấp, tiếp tục"
-        elif entropy > 0.85:  # Rất cao
-            return 'Xỉu' if recent[-1] == 'Tài' else 'Tài', 65, f"Entropy-{window} rất cao, đảo"
-        
-        return None, 0, f"Entropy-{window} bình thường"
-    
-    # ========== THUẬT TOÁN 13: CYCLE CÂN BẰNG ==========
-    def algo_cycle(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 30:
-            return None, 0, "Không đủ dữ liệu"
-        
-        series = [1 if x == 'Tài' else 0 for x in data[-50:]]
-        
-        best_cycle = None
-        best_score = 0
-        
-        for cycle in range(2, 15):
-            if len(series) < cycle * 3:
-                continue
-            
-            matches = 0
-            total = 0
-            for i in range(0, len(series) - cycle * 2, cycle):
-                for j in range(cycle):
-                    if series[i+j] == series[i+cycle+j]:
-                        matches += 1
-                    total += 1
-            
-            if total > 0:
-                score = matches / total
-                if score > best_score and score > 0.8:  # Khắt khe hơn
-                    best_score = score
-                    best_cycle = cycle
-        
-        if best_cycle and best_score > 0.8:
-            pos = len(series) % best_cycle
-            pos = best_cycle if pos == 0 else pos
-            
-            historical = []
-            for i in range(best_cycle, len(series), best_cycle):
-                idx = i - best_cycle + pos - 1
-                if 0 <= idx < len(series):
-                    historical.append(series[idx])
-            
-            if historical:
-                prob = statistics.mean(historical)
-                if abs(prob - 0.5) > 0.2:  # Chỉ khi rõ ràng
-                    pred = 'Tài' if prob > 0.5 else 'Xỉu'
-                    conf = 60 + abs(prob - 0.5) * 80
-                    return pred, min(conf, 85), f"Chu kỳ {best_cycle} rõ ràng"
-        
-        return None, 0, "Không phát hiện chu kỳ rõ"
-    
-    # ========== THUẬT TOÁN 14: SEQUENCE MATCH CÂN BẰNG ==========
-    def algo_sequence(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 15:
-            return None, 0, "Không đủ dữ liệu"
-        
-        for length in [12, 15, 10]:  # Thử nhiều độ dài
-            if len(data) < length + 1:
-                continue
-            
-            current = ''.join([self.to_tx(x) for x in data[-length:]])
-            
-            best_sim = 0
-            best_next = None
-            
-            for i in range(len(data) - length - 1):
-                past = ''.join([self.to_tx(x) for x in data[i:i+length]])
-                matches = sum(a == b for a, b in zip(current, past))
-                sim = matches / length
-                
-                if sim > best_sim and sim >= 0.85:  # Khắt khe hơn
-                    best_sim = sim
-                    best_next = data[i+length]
-            
-            if best_next and best_sim >= 0.85:
-                return best_next, 70, f"Match {length} ký tự ({best_sim:.0%})"
-        
-        return None, 0, "Không tìm thấy match đủ tốt"
-    
-    # ========== THUẬT TOÁN 15: MOMENTUM CÂN BẰNG ==========
-    def algo_momentum(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 20:
-            return None, 0, "Không đủ dữ liệu"
-        
-        n = len(data) // 4
-        phases = [data[i*n:(i+1)*n] for i in range(4)]
-        
-        ratios = [p.count('Tài') / len(p) for p in phases]
-        
-        # Tính momentum
-        mom3 = ratios[3] - ratios[2]
-        
-        # Chỉ khi momentum rất mạnh
-        if mom3 > 0.25:
-            return 'Tài', 65, f"Momentum T mạnh"
-        elif mom3 < -0.25:
-            return 'Xỉu', 65, f"Momentum X mạnh"
-        
-        return None, 0, "Momentum trung lập"
-    
-    # ========== THUẬT TOÁN 16: TREND CÂN BẰNG ==========
-    def algo_trend(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 25:
-            return None, 0, "Không đủ dữ liệu"
-        
-        recent = data[-20:]
-        y = [1 if x == 'Tài' else 0 for x in recent]
-        x = list(range(len(y)))
-        
-        n = len(x)
-        sum_x = sum(x)
-        sum_y = sum(y)
-        sum_xy = sum(xi * yi for xi, yi in zip(x, y))
-        sum_x2 = sum(xi ** 2 for xi in x)
-        
-        slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x ** 2) if (n * sum_x2 - sum_x ** 2) != 0 else 0
-        
-        # Chỉ khi slope rõ ràng
-        if slope > 0.08:
-            return 'Tài', 60, f"Trend T rõ"
-        elif slope < -0.08:
-            return 'Xỉu', 60, f"Trend X rõ"
-        
-        return None, 0, f"Trend không rõ"
-    
-    # ========== THUẬT TOÁN 17: ALTERNATING CÂN BẰNG ==========
-    def algo_alternating(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 8:
-            return None, 0, "Không đủ dữ liệu"
-        
-        recent = data[-8:]
-        
-        # Kiểm tra alternating hoàn hảo
-        perfect = all(recent[i] != recent[i+1] for i in range(7))
-        
-        if perfect:
-            # Pattern T-X-T-X-T-X-T-X
-            if recent[-1] == 'Tài':
-                return 'Xỉu', 65, "Alternating: tiếp X"
-            else:
-                return 'Tài', 65, "Alternating: tiếp T"
-        
-        # Kiểm tra gần alternating
-        switches = sum(1 for i in range(len(recent)-1) if recent[i] != recent[i+1])
-        if switches == 7:  # Gần hoàn hảo
-            return recent[-1], 55, "Gần alternating"
-        
-        return None, 0, "Không alternating"
-    
-    # ========== THUẬT TOÁN 18: BAYESIAN CÂN BẰNG ==========
-    def algo_bayesian(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 15:
-            return None, 0, "Không đủ dữ liệu"
-        
-        # Prior cân bằng 50-50
-        log_odds = 0
-        
-        # Evidence ngắn hạn
-        short = data[-5:]
-        t_short = short.count('Tài') / 5
-        
-        # Chỉ khi cực đoan
-        if t_short > 0.9:
-            log_odds -= 1.5
-        elif t_short < 0.1:
-            log_odds += 1.5
-        
-        # Evidence chuỗi
-        last = data[-1]
-        streak = 1
-        for i in range(len(data)-2, -1, -1):
-            if data[i] == last:
-                streak += 1
-            else:
-                break
-        
-        if streak >= 4:
-            log_odds += -0.8 * streak if last == 'Tài' else 0.8 * streak
-        
-        prob = 1 / (1 + math.exp(-log_odds))
-        
-        # Chỉ dự đoán khi rõ ràng
-        if prob > 0.7:
-            return 'Tài', 65, f"Bayes T rõ ({prob:.0%})"
-        elif prob < 0.3:
-            return 'Xỉu', 65, f"Bayes X rõ ({prob:.0%})"
-        
-        return None, 0, f"Bayes không rõ"
-    
-    # ========== THUẬT TOÁN 19: GOLDEN CÂN BẰNG ==========
-    def algo_golden(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 30:
-            return None, 0, "Không đủ dữ liệu"
-        
-        cut = int(len(data) * 0.618)
-        
-        first = data[:cut]
-        second = data[cut:]
-        
-        t_first = first.count('Tài') / len(first)
-        t_second = second.count('Tài') / len(second)
-        
-        diff = abs(t_second - t_first)
-        
-        # Chỉ khi chênh lệch lớn
-        if diff > 0.25:
-            pred = 'Xỉu' if t_second > t_first else 'Tài'
-            return pred, 60, f"Golden lệch {diff:.0%}"
-        
-        return None, 0, "Golden cân bằng"
-    
-    # ========== THUẬT TOÁN 20: CHAOS CÂN BẰNG ==========
-    def algo_chaos(self, data: List[str]) -> Tuple[Optional[str], float, str]:
-        if len(data) < 20:
-            return None, 0, "Không đủ dữ liệu"
-        
-        # Tìm điểm 5 giống nhau
-        for i in range(5, len(data)):
-            window = data[i-5:i]
-            if len(set(window)) == 1:
-                # Điểm nhạy cảm
-                next_vals = []
-                for j in range(i, min(i+5, len(data))):
-                    next_vals.append(data[j])
-                
-                if next_vals:
-                    t_count = next_vals.count('Tài')
-                    if t_count >= 4:
-                        return 'Tài', 65, f"Chaos -> T"
-                    elif t_count <= 1:
-                        return 'Xỉu', 65, f"Chaos -> X"
-        
-        return None, 0, "Không ở điểm nhạy cảm"
-    
-    # ========== BẢO VỆ CÂN BẰNG ==========
-    def balance_guard(self, data: List[str], current_prediction: Optional[str]) -> Tuple[Optional[str], float, str]:
-        """Kiểm tra và điều chỉnh nếu bị lệch"""
-        global bias_tracker
-        
-        if len(data) < 30:
-            return current_prediction, 0, "Chưa đủ dữ liệu kiểm tra"
-        
-        # Tính tỷ lệ dự đoán gần đây
-        recent_10 = data[-10:]
-        t_ratio = recent_10.count('Tài') / 10
-        
-        # Nếu đang lệch nhiều về một bên
-        if t_ratio > 0.8:  # 8/10 Tài
-            bias_tracker['Tài'] += 1
-            return 'Xỉu', 75, "Bảo vệ cân bằng: quá nhiều T"
-        elif t_ratio < 0.2:  # 2/10 Tài
-            bias_tracker['Xỉu'] += 1
-            return 'Tài', 75, "Bảo vệ cân bằng: quá nhiều X"
-        
-        return current_prediction, 0, "Cân bằng tốt"
-    
-    # ========== ENSEMBLE VOTING CÂN BẰNG ==========
-    def predict(self, data: List[str]) -> Tuple[str, float, str, List[Dict], str]:
-        """Dự đoán với kiểm tra cân bằng"""
-        if len(data) < MIN_PHIEN_PREDICT:
-            pattern_20 = ''.join([self.to_tx(x) for x in data]) if data else ""
-            return "Chờ dữ liệu", 0, f"Cần {MIN_PHIEN_PREDICT} phiên", [], pattern_20
-        
-        algorithms = [
-            ('Pattern 20', self.algo_pattern_20),
-         ('N-Gram 5', lambda d: self.algo_ngram(d, 5)),
-            ('N-Gram 7', lambda d: self.algo_ngram(d, 7)),
-            ('Markov 2', lambda d: self.algo_markov(d, 2)),
-            ('Markov 3', lambda d: self.algo_markov(d, 3)),
-            ('Streak', self.algo_streak),
-            ('Freq 5', lambda d: self.algo_frequency(d, 5)),
-            ('Freq 10', lambda d: self.algo_frequency(d, 10)),
-            ('Freq 20', lambda d: self.algo_frequency(d, 20)),
-            ('Freq 50', lambda d: self.algo_frequency(d, 50)),
-            ('Entropy 15', lambda d: self.algo_entropy(d, 15)),
-            ('Entropy 30', lambda d: self.algo_entropy(d, 30)),
-            ('Cycle', self.algo_cycle),
-            ('Sequence', self.algo_sequence),
-            ('Momentum', self.algo_momentum),
-            ('Trend', self.algo_trend),
-            ('Alternating', self.algo_alternating),
-            ('Bayesian', self.algo_bayesian),
-            ('Golden', self.algo_golden),
-            ('Chaos', self.algo_chaos)
-        ]
-        
-        
-        # phần này nằm trong class BalancedAI
+def _s(table, key):
+    d = table.get(key, {"Tài":0,"Xỉu":0}); t = d["Tài"]+d["Xỉu"]
+    if not t: return {"Tài":0.0,"Xỉu":0.0}
+    return {"Tài":d["Tài"]/t,"Xỉu":d["Xỉu"]/t}
 
-def predict(self, data):
-    votes = {'Tài': 0.0, 'Xỉu': 0.0}
-    details = []
+def _sc_markov():
+    h = list(history)
+    s1 = _s(_t1, h[-1])            if len(h)>=1 else {"Tài":0.0,"Xỉu":0.0}
+    s2 = _s(_t2, h[-2]+"|"+h[-1])  if len(h)>=2 else {"Tài":0.0,"Xỉu":0.0}
+    s3 = _s(_t3, "|".join(h[-3:])) if len(h)>=3 else {"Tài":0.0,"Xỉu":0.0}
+    s4 = _s(_t4, "|".join(h[-4:])) if len(h)>=4 else {"Tài":0.0,"Xỉu":0.0}
+    s5 = _s(_t5, "|".join(h[-5:])) if len(h)>=5 else {"Tài":0.0,"Xỉu":0.0}
+    return s1,s2,s3,s4,s5
 
-    # ===== chạy các algo trước đó để fill votes + details =====
-    for name, algo in self.algorithms:
-        try:
-            result, conf, reason = algo(data)
+def _train_ngram():
+    _ng.clear()
+    h = list(history)
+    for ln in range(1,13):
+        for i in range(len(h)-ln):
+            _ng["|".join(h[i:i+ln])][h[i+ln]] += 1
 
-            if result and conf is not None and conf >= 55:
-                key = name.lower().replace(' ', '_').replace('-', '_')
-                weight = self.weights.get(key, 0)
+def _sc_ngram():
+    sc={"Tài":0.0,"Xỉu":0.0}; h=list(history)
+    for ln in range(min(12,len(h)),0,-1):
+        pat="|".join(h[-ln:]); d=_ng.get(pat)
+        if not d: continue
+        t=d["Tài"]+d["Xỉu"]
+        if not t: continue
+        w=ln**4; sc["Tài"]+=w*d["Tài"]/t; sc["Xỉu"]+=w*d["Xỉu"]/t
+    return sc
 
-                vote_power = weight * (conf / 100)
-                votes[result] += vote_power
+def _train_streak():
+    for d in _sd.values(): d.clear()
+    h=list(history)
+    if not h: return
+    cur,cnt=h[0],1
+    for r in h[1:]:
+        if r==cur: cnt+=1
+        else: _sd[cur][cnt]+=1; cur,cnt=r,1
+    _sd[cur][cnt]+=1
 
-                details.append({
-                    'name': name,
-                    'prediction': result,
-                    'confidence': round(conf, 1),
-                    'weight': weight,
-                    'vote': round(vote_power, 3),
-                    'reason': reason
-                })
+def _cur_streak():
+    h=list(history)
+    if not h: return None,0
+    cur=h[-1]; cnt=1
+    for r in reversed(h[:-1]):
+        if r==cur: cnt+=1
+        else: break
+    return cur,cnt
 
-        except Exception as e:
-            print(f"Lỗi ở {name}: {e}")
-            continue
+def _sc_streak():
+    cur,ln=_cur_streak()
+    if not cur: return {"Tài":0.5,"Xỉu":0.5}
+    dist=_sd[cur]
+    ended =sum(v*(k**1.5) for k,v in dist.items() if k<=ln)
+    longer=sum(v*(k**1.5) for k,v in dist.items() if k>ln)
+    total =ended+longer
+    if not total: return {"Tài":0.5,"Xỉu":0.5}
+    other="Xỉu" if cur=="Tài" else "Tài"
+    return {cur:longer/total, other:ended/total}
 
-    # ===== pattern 20 =====
-    pattern_20 = ''.join([self.to_tx(x) for x in data[-20:]])
+def _sc_point(w=20):
+    pts=list(hist_pt)
+    if len(pts)<5: return {"Tài":0.5,"Xỉu":0.5}
+    avg=sum(pts[-w:])/len(pts[-w:])
+    p_t=max(0.0,min(1.0,(avg-3)/15))
+    return {"Tài":p_t,"Xỉu":1-p_t}
 
-    # ===== guard =====
-    total_votes = votes['Tài'] + votes['Xỉu']
+def _sc_freq(w):
+    h=list(history)
+    if len(h)<w: return {"Tài":0.5,"Xỉu":0.5}
+    ct=h[-w:].count("Tài"); p_x=ct/w
+    return {"Tài":1-p_x,"Xỉu":p_x}
 
-    if total_votes == 0:
-        guard_pred, guard_conf, guard_reason = self.balance_guard(data, None)
+def _sc_momentum():
+    h=list(history)
+    if len(h)<30: return {"Tài":0.5,"Xỉu":0.5}
+    p5=h[-5:].count("Tài")/5; p15=h[-15:].count("Tài")/15; p30=h[-30:].count("Tài")/30
+    mom=(p5-p15)*0.6+(p15-p30)*0.4
+    return {"Tài":max(0.0,min(1.0,0.5+mom)),"Xỉu":max(0.0,min(1.0,0.5-mom))}
 
-        if guard_pred in ['Tài', 'Xỉu']:
-            return guard_pred, guard_conf, guard_reason, [], pattern_20
+def _sc_repeat():
+    h=list(history)
+    if len(h)<8: return {"Tài":0.5,"Xỉu":0.5}
+    sc={"Tài":0.0,"Xỉu":0.0}
+    for cycle in (2,3,4,5):
+        if len(h)<cycle*3: continue
+        match=sum(1 for i in range(1,4) if h[-i]==h[-i-cycle])
+        if match>=2:
+            w=match*cycle; sc[h[-cycle]]+=w
+    total=sc["Tài"]+sc["Xỉu"]
+    if not total: return {"Tài":0.5,"Xỉu":0.5}
+    return {"Tài":sc["Tài"]/total,"Xỉu":sc["Xỉu"]/total}
 
-        return "Không chắc chắn", 0, "Không đủ tín hiệu", [], pattern_20
+def _entropy(w=40):
+    h=list(history)[-w:]; n=len(h)
+    if n==0: return 1.0
+    ct=h.count("Tài"); cx=n-ct
+    if ct==0 or cx==0: return 0.0
+    pt,px=ct/n,cx/n
+    return -(pt*math.log2(pt)+px*math.log2(px))
 
-    # ===== tính kết quả =====
-    t_ratio = votes['Tài'] / total_votes
-    final = 'Tài' if t_ratio > 0.5 else 'Xỉu'
-    margin = abs(t_ratio - 0.5)
+def _aw(key, base):
+    a=_acc[key]
+    if a["n"]<20: return base
+    return max(0.005, base*(1+4.0*(a["ok"]/a["n"]-0.5)))
 
-    # ===== balance guard =====
-    guard_pred, guard_conf, guard_reason = self.balance_guard(data, final)
+def _win(sc):
+    return "Tài" if sc.get("Tài",0)>=sc.get("Xỉu",0) else "Xỉu"
 
-    if guard_pred in ['Tài', 'Xỉu'] and margin < 0.15:
-        final = guard_pred
-        reason = guard_reason
-        conf = guard_conf
+def _update_acc(actual):
+    for k,p in _prev_model.items():
+        if p: _acc[k]["n"]+=1; _acc[k]["ok"]+=(p==actual)
+
+def _update_stats(actual):
+    global _prev_pred
+    if not _prev_pred or _prev_pred=="Đang chờ": return
+    stats["tong"]+=1
+    if _prev_pred==actual:
+        stats["dung"]+=1; stats["cd"]+=1; stats["cs"]=0
+        if stats["cd"]>stats["max_cd"]: stats["max_cd"]=stats["cd"]
     else:
-        base_conf = 50 + margin * 100
-        active = len([d for d in details if d['prediction'] == final])
-        conf = min(base_conf + active * 1.5, 95)
+        stats["sai"]+=1; stats["cs"]+=1; stats["cd"]=0
+        if stats["cs"]>stats["max_cs"]: stats["max_cs"]=stats["cs"]
 
-        same = [d for d in details if d['prediction'] == final]
-        if same:
-            top = max(same, key=lambda x: x['vote'])
-            reason = f"{top['name']} mạnh, {active}/20 đồng ý"
-        else:
-            reason = "Tổng hợp"
+def _acc_str(key):
+    a=_acc[key]
+    if a["n"]==0: return "Chưa có"
+    return f"{a['ok']}/{a['n']} ({a['ok']/a['n']*100:.0f}%)"
 
-    return final, round(conf, 1), reason, details, pattern_20
-        
-       
-    def predict(self, data):   # ✅ indent 4 spaces trong class
-        total_votes = votes['Tài'] + votes['Xỉu']
+def get_prediction():
+    if len(history)<MIN_PHIEN: return "Đang chờ", 0.0
 
-        if total_votes > 0:
-            t_ratio = votes['Tài'] / total_votes
-        else:
-            t_ratio = 0.5
+    _train_markov(); _train_ngram(); _train_streak()
+    e=_entropy()
+    s1,s2,s3,s4,s5=_sc_markov()
+    sng=_sc_ngram(); ssk=_sc_streak(); spt=_sc_point()
+    sf10=_sc_freq(10); sf20=_sc_freq(20)
+    smom=_sc_momentum(); srep=_sc_repeat()
+    ef=max(0.3,1-e*0.4)
 
-        final = 'Tài' if t_ratio > 0.5 else 'Xỉu'
-        margin = abs(t_ratio - 0.5)
+    w1=_aw("m1",0.06); w2=_aw("m2",0.09); w3=_aw("m3",0.12)
+    w4=_aw("m4",0.13); w5=_aw("m5",0.13); wng=_aw("ng",0.18*ef)
+    wsk=_aw("sk",0.10); wpt=_aw("pt",0.06); wf10=_aw("fr10",0.04)
+    wf20=_aw("fr20",0.04); wmom=_aw("mom",0.03); wrep=_aw("rep",0.02)
+    tw=w1+w2+w3+w4+w5+wng+wsk+wpt+wf10+wf20+wmom+wrep
 
-        return final, margin
-        
-        # Kiểm tra cân bằng
-        guard_pred, guard_conf, guard_reason = self.balance_guard(data, final)
-        
-        # Nếu balance guard can thiệp và margin nhỏ, nghe theo guard
-        if guard_pred and margin < 0.15:
-            final = guard_pred
-            reason = guard_reason
-            conf = guard_conf
-        else:
-            # Tính confidence
-            base_conf = 50 + margin * 100
-            active = len([d for d in details if d['prediction'] == final])
-            conf = min(base_conf + active * 1.5, 95)
-            
-            same = [d for d in details if d['prediction'] == final]
-            if same:
-                top = max(same, key=lambda x: x['vote'])
-                reason = f"{top['name']} mạnh, {active}/20 đồng ý"
-            else:
-                reason = "Tổng hợp"
-        
-        return final, round(conf, 1), reason, details, pattern_20
+    raw={}
+    for r in ("Tài","Xỉu"):
+        raw[r]=(w1*s1.get(r,0)+w2*s2.get(r,0)+w3*s3.get(r,0)+w4*s4.get(r,0)+
+                w5*s5.get(r,0)+wng*sng.get(r,0)+wsk*ssk.get(r,0)+wpt*spt.get(r,0)+
+                wf10*sf10.get(r,0)+wf20*sf20.get(r,0)+wmom*smom.get(r,0)+wrep*srep.get(r,0))/tw
 
+    s=raw["Tài"]+raw["Xỉu"]
+    if s>0: raw={r:v/s for r,v in raw.items()}
+    else:   raw={"Tài":0.5,"Xỉu":0.5}
 
-# Khởi tạo AI
-balanced_ai = BalancedAI()
+    pred="Tài" if raw["Tài"]>=raw["Xỉu"] else "Xỉu"
+    conf=max(raw["Tài"],raw["Xỉu"])
+    counted=[_acc[k]["ok"]/_acc[k]["n"] for k in _acc if _acc[k]["n"]>=15]
+    hist_acc=sum(counted)/len(counted) if counted else 0.5
+    all_p=[_win(s1),_win(s2),_win(s3),_win(s4),_win(s5),
+           _win(sng),_win(ssk),_win(spt),_win(sf10),_win(sf20),_win(smom),_win(srep)]
+    dong_thuan=all_p.count(pred)/len(all_p)
+    tin_cay=hist_acc*0.45+(conf-0.5)*2*0.35+dong_thuan*0.20
+    tin_cay_pct=round(max(50.0,min(95.0,50+tin_cay*45)),1)
+
+    global _prev_model
+    _prev_model={"m1":_win(s1),"m2":_win(s2),"m3":_win(s3),"m4":_win(s4),"m5":_win(s5),
+                 "ng":_win(sng),"sk":_win(ssk),"pt":_win(spt),"fr10":_win(sf10),
+                 "fr20":_win(sf20),"mom":_win(smom),"rep":_win(srep)}
+    return pred, tin_cay_pct
 
 
 # ===============================
 # BOT LẤY DỮ LIỆU
 # ===============================
 def fetch_data_loop():
-    global last_processed_session_id, latest_data, history, history_details, accuracy_tracker, bias_tracker
-
-    last_prediction = None
-    last_conf = 0
-
-    
+    global last_processed_session_id, latest_data, _prev_pred
 
     while True:
         try:
-            res = requests.get(API_URL, timeout=10)
+            res  = requests.get(API_URL, timeout=10)
             data = res.json()
-
             list_data = data.get("list", [])
-            if not list_data:
-                time.sleep(2)
-                continue
+            if not list_data: time.sleep(2); continue
 
-            phien = list_data[0]
+            phien    = list_data[0]
             phien_id = phien.get("id")
+            if phien_id == last_processed_session_id: time.sleep(2); continue
 
-            if phien_id == last_processed_session_id:
-                time.sleep(2)
-                continue
+            dices    = phien.get("dices")
+            tong     = phien.get("point")
+            d1,d2,d3 = dices
+            ket_qua  = "Tài" if tong>=11 else "Xỉu"
 
-            dices = phien.get("dices")
-            tong = phien.get("point")
-            d1, d2, d3 = dices
-            
-            ket_qua = "Tài" if tong >= 11 else "Xỉu"
+            _update_stats(ket_qua)
+            if len(history)>=MIN_PHIEN: _update_acc(ket_qua)
+
+            history.append(ket_qua)
+            hist_pt.append(tong)
             last_processed_session_id = phien_id
 
-            # Lưu lịch sử
-            history.append(ket_qua)
-            history_details.append({
-                'phien': phien_id,
-                'dices': dices,
-                'tong': tong,
-                'ket_qua': ket_qua,
-                'time': datetime.now().strftime("%H:%M:%S")
+            pred, tin_cay = get_prediction()
+            _prev_pred = pred
+
+            # ── JSON GIỮ NGUYÊN FORMAT GỐC ──
+            latest_data.update({
+                "Phiên":          phien_id,
+                "Xúc xắc 1":      d1,
+                "Xúc xắc 2":      d2,
+                "Xúc xắc 3":      d3,
+                "Tổng":           tong,
+                "Kết":            ket_qua,
+                "Phiên hiện tại": phien_id + 1,
+                "Dự đoán":        pred,
+                "Độ tin cậy":     tin_cay,
+                "ID":             "tuananh"
             })
-            
-            if len(history) > MAX_HISTORY:
-                history.pop(0)
-                history_details.pop(0)
 
-            # Kiểm tra dự đoán cũ
-            if last_prediction and ket_qua in ['Tài', 'Xỉu']:
-                correct = (last_prediction == ket_qua)
-                accuracy_tracker['history'].append(correct)
-                accuracy_tracker['total'] += 1
-                if correct:
-                    accuracy_tracker['correct'] += 1
-                    if ket_qua == 'Tài':
-                        accuracy_tracker['tai_correct'] += 1
-                    else:
-                        accuracy_tracker['xiu_correct'] += 1
-                
-                status = "✅ ĐÚNG" if correct else "❌ SAI"
-                acc_rate = accuracy_tracker['correct'] / accuracy_tracker['total'] * 100 if accuracy_tracker['total'] > 0 else 0
-                
-                # Kiểm tra bias
-                tai_rate = history.count('Tài') / len(history) if history else 0.5
-                
-                
+            # ── IN TERMINAL ──
+            so=len(history); cur_val,cur_len=_cur_streak()
+            td=stats["tong"]
+            acc_s=f"{stats['dung']}/{td} ({stats['dung']/td*100:.1f}%)" if td else "Chưa có"
 
-            # Dự đoán mới
-            du_doan, do_tin_cay, ly_do, chi_tiet, pattern_20 = balanced_ai.predict(history)
-            
-            if du_doan in ['Tài', 'Xỉu']:
-                last_prediction = du_doan
-                last_conf = do_tin_cay
+            print("\n"+"="*44)
+            print(f"  Phiên         : {phien_id}")
+            print(f"  Xúc xắc      : {d1}  {d2}  {d3}")
+            print(f"  Tổng          : {tong}")
+            print(f"  Kết quả       : {ket_qua}")
+            print(f"  Chuỗi         : {cur_val} x{cur_len}" if cur_val else "  Chuỗi         : --")
+            print(f"  Bộ nhớ        : {so}/{MAX_PHIEN} phiên")
+            print("-"*44)
+            if pred=="Đang chờ":
+                print(f"  Dự đoán       : Chờ thêm {MIN_PHIEN-so} phiên...")
             else:
-                last_prediction = None
-
-            
-            
-            latest_data = {
-                "phiên": phien_id,
-                "xúc_xắc_1": d1,
-                "xúc_xắc_2": d2,
-                "xúc_xắc_3": d3,
-                "tổng": tong,
-                "kết": ket_qua,
-                "dự_đoán": du_doan if du_doan in ['Tài', 'Xỉu'] else "Chờ",
-                "pattern": pattern_20,
-                "độ_tin_cậy": do_tin_cay,
-                "id": "tuananh"
-            }
+                print(f"  Dự đoán P.{phien_id+1}  : >>> {pred} <<<")
+                print(f"  Độ tin cậy    : {tin_cay}%")
+                print("-"*44)
+                print(f"  Đúng/Sai      : {stats['dung']}/{stats['sai']}  |  {acc_s}")
+                print(f"  Chuỗi đúng   : {stats['cd']} (max {stats['max_cd']})")
+                print(f"  Chuỗi sai    : {stats['cs']} (max {stats['max_cs']})")
+                print("-"*44)
+                print("  Accuracy 12 mô hình:")
+                for lbl,key in [("Markov 1","m1"),("Markov 2","m2"),("Markov 3","m3"),
+                                 ("Markov 4","m4"),("Markov 5","m5"),("N-Gram  ","ng"),
+                                 ("Streak  ","sk"),("Point   ","pt"),("Freq-10 ","fr10"),
+                                 ("Freq-20 ","fr20"),("Momentum","mom"),("Repeat  ","rep")]:
+                    print(f"    {lbl}: {_acc_str(key)}")
+            print(f"  ID            : tuananh")
+            print("="*44)
 
         except Exception as e:
-            print(f"[LỖI] {str(e)[:60]}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Lỗi:", e)
 
         time.sleep(2)
 
@@ -748,43 +331,19 @@ threading.Thread(target=fetch_data_loop, daemon=True).start()
 
 
 # ===============================
-# API
+# API (GIỮ NGUYÊN)
 # ===============================
 @app.route("/api/taixiumd5", methods=["GET"])
 def api_data():
     return jsonify({"data": latest_data})
 
-
-@app.route("/api/history", methods=["GET"])
-def api_history():
-    pattern_all = ''.join(['T' if x == 'Tài' else 'X' for x in history])
-    tai_count = history.count('Tài')
-    xiu_count = history.count('Xỉu')
-    
-    return jsonify({
-        "history": history_details[-50:],
-        "pattern_full": pattern_all,
-        "pattern_20_gần_nhất": pattern_all[-20:] if len(pattern_all) >= 20 else pattern_all,
-        "số_phiên_đã_lưu": len(history),
-        "tỷ_lệ_tài_trong_lịch_sử": round(tai_count / len(history) * 100, 1) if history else 50,
-        "tỷ_lệ_xỉu_trong_lịch_sử": round(xiu_count / len(history) * 100, 1) if history else 50,
-        "độ_chính_xác": {
-            "tổng": accuracy_tracker['total'],
-            "đúng": accuracy_tracker['correct'],
-            "tỷ_lệ": round(accuracy_tracker['correct'] / accuracy_tracker['total'] * 100, 1) if accuracy_tracker['total'] > 0 else 0,
-            "tài_đúng": accuracy_tracker['tai_correct'],
-            "xỉu_đúng": accuracy_tracker['xiu_correct']
-        },
-        "cân_bằng_can_thiệp": bias_tracker
-    })
-
-
-
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot Tài Xỉu – 12 AI – đang chạy"
 
 
 # ===============================
 # RUN SERVER
 # ===============================
 if __name__ == "__main__":
-    print("Server đang chạy trên port 10000...")
-    app.run(host="0.0.0.0", port=10000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=10000)
