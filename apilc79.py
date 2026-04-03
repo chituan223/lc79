@@ -11,7 +11,7 @@ from datetime import datetime
 # ===============================
 API_URL    = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
 MIN_PHIEN  = 20
-MAX_PHIEN  = 100
+MAX_PHIEN  = 200
 
 app = Flask(__name__)
 
