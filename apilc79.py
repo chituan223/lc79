@@ -10,8 +10,8 @@ from datetime import datetime
 # CẤU HÌNH
 # ===============================
 API_URL    = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-MIN_PHIEN  = 20
-MAX_PHIEN  = 200
+MIN_PHIEN  = 15
+MAX_PHIEN  = 50
 
 app = Flask(__name__)
 
@@ -54,6 +54,7 @@ _acc = {k: {"ok":0,"n":0} for k in ("m1","m2","m3","m4","m5","ng","sk","pt","fr1
 _prev_model = {}
 _prev_pred  = None
 stats = {"tong":0,"dung":0,"sai":0,"cd":0,"cs":0,"max_cd":0,"max_cs":0}
+lich_su = []   # lưu lịch sử dự đoán: {"phien", "du_doan", "ket_qua", "dung"}
 
 
 def _train_markov():
@@ -180,16 +181,19 @@ def _update_acc(actual):
     for k,p in _prev_model.items():
         if p: _acc[k]["n"]+=1; _acc[k]["ok"]+=(p==actual)
 
-def _update_stats(actual):
+def _update_stats(actual, phien_id=None):
     global _prev_pred
     if not _prev_pred or _prev_pred=="Đang chờ": return
+    dung = (_prev_pred==actual)
     stats["tong"]+=1
-    if _prev_pred==actual:
+    if dung:
         stats["dung"]+=1; stats["cd"]+=1; stats["cs"]=0
         if stats["cd"]>stats["max_cd"]: stats["max_cd"]=stats["cd"]
     else:
         stats["sai"]+=1; stats["cs"]+=1; stats["cd"]=0
         if stats["cs"]>stats["max_cs"]: stats["max_cs"]=stats["cs"]
+    lich_su.append({"phien": phien_id, "du_doan": _prev_pred, "ket_qua": actual, "dung": "✅" if dung else "❌"})
+    if len(lich_su)>100: lich_su.pop(0)
 
 def _acc_str(key):
     a=_acc[key]
@@ -262,7 +266,7 @@ def fetch_data_loop():
             d1,d2,d3 = dices
             ket_qua  = "Tài" if tong>=11 else "Xỉu"
 
-            _update_stats(ket_qua)
+            _update_stats(ket_qua, phien_id)
             if len(history)>=MIN_PHIEN: _update_acc(ket_qua)
 
             history.append(ket_qua)
@@ -337,9 +341,24 @@ threading.Thread(target=fetch_data_loop, daemon=True).start()
 def api_data():
     return jsonify({"data": latest_data})
 
+@app.route("/api/lichsu", methods=["GET"])
+def api_lich_su():
+    td = stats["tong"]
+    return jsonify({
+        "tong_du_doan":  td,
+        "dung":          stats["dung"],
+        "sai":           stats["sai"],
+        "ty_le_dung":    f"{stats['dung']/td*100:.1f}%" if td else "0%",
+        "chuoi_dung":    stats["cd"],
+        "chuoi_sai":     stats["cs"],
+        "max_chuoi_dung": stats["max_cd"],
+        "max_chuoi_sai":  stats["max_cs"],
+        "lich_su_20":    lich_su[-20:]
+    })
+
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot Tài Xỉu – 12 AI – đang chạy"
+    return "TOOL_VER_5.0"
 
 
 # ===============================
