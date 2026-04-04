@@ -11,7 +11,7 @@ from datetime import datetime
 # ===============================
 API_URL    = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
 MIN_PHIEN  = 15
-MAX_PHIEN  = 50
+MAX_PHIEN  = 30
 
 app = Flask(__name__)
 
@@ -201,7 +201,7 @@ def _acc_str(key):
     return f"{a['ok']}/{a['n']} ({a['ok']/a['n']*100:.0f}%)"
 
 def get_prediction():
-    if len(history)<MIN_PHIEN: return "Đang chờ", 0.0
+    if len(history)<MIN_PHIEN: return "Đang chờ", 0.0, ""
 
     _train_markov(); _train_ngram(); _train_streak()
     e=_entropy()
@@ -234,14 +234,22 @@ def get_prediction():
     all_p=[_win(s1),_win(s2),_win(s3),_win(s4),_win(s5),
            _win(sng),_win(ssk),_win(spt),_win(sf10),_win(sf20),_win(smom),_win(srep)]
     dong_thuan=all_p.count(pred)/len(all_p)
-    tin_cay=hist_acc*0.45+(conf-0.5)*2*0.35+dong_thuan*0.20
-    tin_cay_pct=round(max(50.0,min(95.0,50+tin_cay*45)),1)
+    # Tỷ lệ thật: 0% = không chắc, 50% = rất chắc
+    raw_conf = (conf - 0.5) * 2   # [0, 1]
+    acc_bonus = max(0, hist_acc - 0.5) * 2  # bonus từ accuracy thực
+    thuan_bonus = max(0, dong_thuan - 0.5) * 2
+    tin_cay_pct = round(min(50.0, (raw_conf*0.60 + acc_bonus*0.25 + thuan_bonus*0.15)*50), 1)
 
     global _prev_model
     _prev_model={"m1":_win(s1),"m2":_win(s2),"m3":_win(s3),"m4":_win(s4),"m5":_win(s5),
                  "ng":_win(sng),"sk":_win(ssk),"pt":_win(spt),"fr10":_win(sf10),
                  "fr20":_win(sf20),"mom":_win(smom),"rep":_win(srep)}
-    return pred, tin_cay_pct
+
+    # Pattern mẫu 20 phiên gần nhất (T/X thật từ dữ liệu)
+    h = list(history)
+    pattern_20 = "".join("T" if x=="Tài" else "X" for x in h[-20:])
+
+    return pred, tin_cay_pct, pattern_20
 
 
 # ===============================
@@ -273,7 +281,7 @@ def fetch_data_loop():
             hist_pt.append(tong)
             last_processed_session_id = phien_id
 
-            pred, tin_cay = get_prediction()
+            pred, tin_cay, pattern_20 = get_prediction()
             _prev_pred = pred
 
             # ── JSON GIỮ NGUYÊN FORMAT GỐC ──
@@ -287,6 +295,7 @@ def fetch_data_loop():
                 "Phiên hiện tại": phien_id + 1,
                 "Dự đoán":        pred,
                 "Độ tin cậy":     tin_cay,
+                "Pattern ":     pattern_20,
                 "ID":             "tuananh"
             })
 
@@ -306,8 +315,9 @@ def fetch_data_loop():
             if pred=="Đang chờ":
                 print(f"  Dự đoán       : Chờ thêm {MIN_PHIEN-so} phiên...")
             else:
+                print(f"  Pattern 20    : {pattern_20}")
                 print(f"  Dự đoán P.{phien_id+1}  : >>> {pred} <<<")
-                print(f"  Độ tin cậy    : {tin_cay}%")
+                print(f"  Độ tin cậy    : {tin_cay}% / 50% max")
                 print("-"*44)
                 print(f"  Đúng/Sai      : {stats['dung']}/{stats['sai']}  |  {acc_s}")
                 print(f"  Chuỗi đúng   : {stats['cd']} (max {stats['max_cd']})")
@@ -358,7 +368,7 @@ def api_lich_su():
 
 @app.route("/", methods=["GET"])
 def home():
-    return "TOOL_VER_5.0"
+    return "TOOL VIP PRO 5.0"
 
 
 # ===============================
