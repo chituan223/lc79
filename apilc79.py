@@ -10,14 +10,21 @@ from datetime import datetime
 # CẤU HÌNH
 # ===============================
 API_URL   = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-MIN_PHIEN = 15
-MAX_PHIEN = 50
+MIN_PHIEN = 10
+MAX_PHIEN = 21
 
 app = Flask(__name__)
 
 # ===============================
-# DỮ LIỆU (GIỮ NGUYÊN JSON GỐC)
+# DATA
 # ===============================
+history  = deque(maxlen=MAX_PHIEN)
+hist_pt  = deque(maxlen=MAX_PHIEN)
+lich_su  = []
+stats    = {"tong":0,"dung":0,"sai":0,"cd":0,"cs":0,"max_cd":0,"max_cs":0}
+last_phien  = None
+_prev_pred  = None
+
 latest_data = {
     "Phiên":          None,
     "Xúc xắc 1":      None,
@@ -26,21 +33,11 @@ latest_data = {
     "Tổng":           None,
     "Kết":            None,
     "Phiên hiện tại": None,
-    "Dự đoán":        "Đang chờ",
-    "Độ tin cậy":     0.0,
+    "Dự đoán":        "Chưa đủ dữ liệu",
+    "Độ tin cậy":     0,
+    "Pattern":        "",
     "ID":             "tuananh"
 }
-
-last_processed_session_id = None
-
-# ===============================
-# LỊCH SỬ
-# ===============================
-history  = deque(maxlen=MAX_PHIEN)
-hist_pt  = deque(maxlen=MAX_PHIEN)
-lich_su  = []
-stats    = {"tong":0,"dung":0,"sai":0,"cd":0,"cs":0,"max_cd":0,"max_cs":0}
-_prev_pred  = None
 
 # ═══════════════════════════════════════════
 #  AI ENGINE – 15 MÔ HÌNH
@@ -58,7 +55,6 @@ _acc = {k: {"ok":0,"n":0} for k in
 _prev_model = {}
 
 
-# ── 1-5: Markov bậc 1→5 ─────────────────────────────
 def _train_markov():
     for tb in (_t1,_t2,_t3,_t4,_t5):
         for d in tb.values(): d.update({"Tài":0,"Xỉu":0})
@@ -83,8 +79,6 @@ def _sc_markov():
     s5=_s(_t5,"|".join(h[-5:])) if len(h)>=5 else {"Tài":0.0,"Xỉu":0.0}
     return s1,s2,s3,s4,s5
 
-
-# ── 6: N-Gram tối đa 12 phiên ───────────────────────
 def _train_ngram():
     _ng.clear(); h=list(history)
     for ln in range(1,13):
@@ -101,8 +95,6 @@ def _sc_ngram():
         w=ln**4; sc["Tài"]+=w*d["Tài"]/t; sc["Xỉu"]+=w*d["Xỉu"]/t
     return sc
 
-
-# ── 7: Streak Reversal ──────────────────────────────
 def _train_streak():
     for d in _sd.values(): d.clear()
     h=list(history)
@@ -133,44 +125,35 @@ def _sc_streak():
     other="Xỉu" if cur=="Tài" else "Tài"
     return {cur:longer/total, other:ended/total}
 
-
-# ── 8: Point Bias ───────────────────────────────────
 def _sc_point(w=20):
     pts=list(hist_pt)
     if len(pts)<5: return {"Tài":0.5,"Xỉu":0.5}
-    avg=sum(pts[-w:])/len(pts[-w:])
-    # Slope phân tích xu hướng tăng/giảm
-    n=len(pts[-w:])
+    recent=pts[-w:]
+    avg=sum(recent)/len(recent)
+    n=len(recent)
     if n>=6:
-        half1=sum(pts[-w:-w//2])/(n//2)
-        half2=sum(pts[-w//2:])/(n-n//2)
-        slope=(half2-half1)/10.5
+        h1=sum(recent[:n//2])/(n//2)
+        h2=sum(recent[n//2:])/(n-n//2)
+        slope=(h2-h1)/10.5
     else: slope=0
     p_t=max(0.0,min(1.0,(avg-3)/15+slope*0.1))
     return {"Tài":p_t,"Xỉu":1-p_t}
 
-
-# ── 9-10: Frequency Window ──────────────────────────
 def _sc_freq(w):
     h=list(history)
     if len(h)<w: return {"Tài":0.5,"Xỉu":0.5}
     ct=h[-w:].count("Tài"); p_x=ct/w
     return {"Tài":1-p_x,"Xỉu":p_x}
 
-
-# ── 11: Momentum đa tầng ────────────────────────────
 def _sc_momentum():
     h=list(history)
     if len(h)<20: return {"Tài":0.5,"Xỉu":0.5}
-    n=min(len(h),30)
     p5 =h[-5:].count("Tài")/5  if len(h)>=5  else 0.5
     p10=h[-10:].count("Tài")/10 if len(h)>=10 else 0.5
     p20=h[-20:].count("Tài")/20 if len(h)>=20 else 0.5
     mom=(p5-p10)*0.6+(p10-p20)*0.4
     return {"Tài":max(0.0,min(1.0,0.5+mom)),"Xỉu":max(0.0,min(1.0,0.5-mom))}
 
-
-# ── 12: Repeat Pattern ──────────────────────────────
 def _sc_repeat():
     h=list(history)
     if len(h)<8: return {"Tài":0.5,"Xỉu":0.5}
@@ -184,8 +167,6 @@ def _sc_repeat():
     if not total: return {"Tài":0.5,"Xỉu":0.5}
     return {"Tài":sc["Tài"]/total,"Xỉu":sc["Xỉu"]/total}
 
-
-# ── 13: Alternating Pattern ─────────────────────────
 def _sc_alternating():
     h=list(history)
     if len(h)<6: return {"Tài":0.5,"Xỉu":0.5}
@@ -198,18 +179,14 @@ def _sc_alternating():
         return {h[-1]:0.70, ("Xỉu" if h[-1]=="Tài" else "Tài"):0.30}
     return {"Tài":0.5,"Xỉu":0.5}
 
-
-# ── 14: Cycle Detection ─────────────────────────────
 def _sc_cycle():
     h=list(history)
     if len(h)<12: return {"Tài":0.5,"Xỉu":0.5}
     best_score=0; best_pred=None
     for cycle in range(2,7):
         if len(h)<cycle*2+1: continue
-        match=0; total=0
-        for i in range(len(h)-cycle):
-            if h[i]==h[i+cycle]: match+=1
-            total+=1
+        match=sum(1 for i in range(len(h)-cycle) if h[i]==h[i+cycle])
+        total=len(h)-cycle
         if total==0: continue
         score=match/total
         if score>best_score and score>0.7:
@@ -221,30 +198,22 @@ def _sc_cycle():
         return {best_pred:best_score, ("Xỉu" if best_pred=="Tài" else "Tài"):1-best_score}
     return {"Tài":0.5,"Xỉu":0.5}
 
-
-# ── 15: Bayesian cập nhật liên tục ──────────────────
 def _sc_bayesian():
     h=list(history)
     if len(h)<8: return {"Tài":0.5,"Xỉu":0.5}
-    # Prior = 50/50
     log_odds=0.0
-    # Evidence 1: tần suất gần nhất
     w5=h[-5:].count("Tài")/5 if len(h)>=5 else 0.5
     if w5>0.8:   log_odds -= 1.2
     elif w5<0.2: log_odds += 1.2
-    # Evidence 2: streak hiện tại
     cur,ln=_cur_streak()
     if cur and ln>=4:
         log_odds += -0.7*ln if cur=="Tài" else 0.7*ln
-    # Evidence 3: xen kẽ
     if len(h)>=4:
         alt=sum(1 for i in range(3) if h[-1-i]!=h[-2-i])
         if alt==3: log_odds += 0.5 if h[-1]=="Xỉu" else -0.5
     prob=1/(1+math.exp(-log_odds))
     return {"Tài":prob,"Xỉu":1-prob}
 
-
-# ── Entropy ─────────────────────────────────────────
 def _entropy(w=30):
     h=list(history)[-w:]; n=len(h)
     if n==0: return 1.0
@@ -253,13 +222,10 @@ def _entropy(w=30):
     pt,px=ct/n,cx/n
     return -(pt*math.log2(pt)+px*math.log2(px))
 
-
-# ── Adaptive Weight ─────────────────────────────────
 def _aw(key, base):
     a=_acc[key]
     if a["n"]<15: return base
-    rate=a["ok"]/a["n"]
-    return max(0.005, base*(1+4.0*(rate-0.5)))
+    return max(0.005, base*(1+4.0*(a["ok"]/a["n"]-0.5)))
 
 def _win(sc):
     return "Tài" if sc.get("Tài",0)>=sc.get("Xỉu",0) else "Xỉu"
@@ -270,7 +236,7 @@ def _update_acc(actual):
 
 def _update_stats(actual, phien_id=None):
     global _prev_pred
-    if not _prev_pred or _prev_pred=="Đang chờ": return
+    if not _prev_pred or _prev_pred in ("Chưa đủ dữ liệu","Đang chờ"): return
     dung=(_prev_pred==actual)
     stats["tong"]+=1
     if dung:
@@ -289,10 +255,11 @@ def _acc_str(key):
 
 
 # ===============================
-# DỰ ĐOÁN CHÍNH – 15 MÔ HÌNH
+# DỰ ĐOÁN – 15 MÔ HÌNH
 # ===============================
-def get_prediction():
-    if len(history)<MIN_PHIEN: return "Đang chờ", 0.0, ""
+def du_doan_ai():
+    if len(history)<MIN_PHIEN:
+        return "Chưa đủ dữ liệu", 0
 
     _train_markov(); _train_ngram(); _train_streak()
     e=_entropy()
@@ -325,22 +292,17 @@ def get_prediction():
     pred="Tài" if raw["Tài"]>=raw["Xỉu"] else "Xỉu"
     conf=max(raw["Tài"],raw["Xỉu"])
 
-    # Accuracy lịch sử thực tế
     counted=[_acc[k]["ok"]/_acc[k]["n"] for k in _acc if _acc[k]["n"]>=10]
     hist_acc=sum(counted)/len(counted) if counted else 0.5
-
-    # Đồng thuận mô hình
     all_p=[_win(s1),_win(s2),_win(s3),_win(s4),_win(s5),_win(sng),_win(ssk),
            _win(spt),_win(sf10),_win(sf20),_win(smom),_win(srep),
            _win(salt),_win(scyc),_win(sbay)]
     dong_thuan=all_p.count(pred)/len(all_p)
-
-    # Độ tin cậy 50–100% (thật từ huấn luyện)
-    raw_conf=(conf-0.5)*2          # [0,1]
+    raw_conf=(conf-0.5)*2
     acc_bonus=max(0,hist_acc-0.5)*2
     thuan_bonus=max(0,dong_thuan-0.5)*2
     score=raw_conf*0.50+acc_bonus*0.30+thuan_bonus*0.20
-    tin_cay=round(max(50.0, min(100.0, 50+score*50)), 1)
+    tin_cay=round(max(50.0,min(100.0,50+score*50)),1)
 
     global _prev_model
     _prev_model={
@@ -349,94 +311,83 @@ def get_prediction():
         "fr20":_win(sf20),"mom":_win(smom),"rep":_win(srep),
         "alt":_win(salt),"cyc":_win(scyc),"bay":_win(sbay)
     }
-
-    h=list(history)
-    pattern_20="".join("T" if x=="Tài" else "X" for x in h[-20:])
-    return pred, tin_cay, pattern_20
+    return pred, tin_cay
 
 
 # ===============================
-# BOT LẤY DỮ LIỆU
+# FETCH DATA
 # ===============================
-def fetch_data_loop():
-    global last_processed_session_id, latest_data, _prev_pred
+def fetch_loop():
+    global last_phien, latest_data, _prev_pred
 
     while True:
         try:
-            res  = requests.get(API_URL, timeout=10)
+            res  = requests.get(API_URL, timeout=5)
             data = res.json()
-            list_data = data.get("list", [])
-            if not list_data: time.sleep(2); continue
+            ds   = data.get("list", [])
+            if not ds: time.sleep(2); continue
 
-            phien    = list_data[0]
-            phien_id = phien.get("id")
-            if phien_id==last_processed_session_id: time.sleep(2); continue
+            item  = ds[0]
+            phien = item.get("id")
+            if phien==last_phien: time.sleep(2); continue
 
-            dices    = phien.get("dices")
-            tong     = phien.get("point")
-            d1,d2,d3 = dices
-            ket_qua  = "Tài" if tong>=11 else "Xỉu"
+            d1,d2,d3 = item.get("dices")
+            tong      = item.get("point")
+            ket       = "Tài" if tong>=11 else "Xỉu"
 
-            _update_stats(ket_qua, phien_id)
-            if len(history)>=MIN_PHIEN: _update_acc(ket_qua)
+            # Cập nhật stats & accuracy
+            _update_stats(ket, phien)
+            if len(history)>=MIN_PHIEN: _update_acc(ket)
 
-            history.append(ket_qua)
+            # Lưu lịch sử
+            history.append(ket)
             hist_pt.append(tong)
-            last_processed_session_id = phien_id
 
-            pred, tin_cay, pattern_20 = get_prediction()
-            _prev_pred = pred
+            # Pattern 20 phiên
+            pattern = "".join(
+                ["T" if x=="Tài" else "X" for x in list(history)[-20:]]
+            )
 
-            # ── JSON GIỮ NGUYÊN FORMAT GỐC ──
-            latest_data.update({
-                "Phiên":          phien_id,
-                "Xúc xắc 1":      d1,
-                "Xúc xắc 2":      d2,
-                "Xúc xắc 3":      d3,
-                "Tổng":           tong,
-                "Kết":            ket_qua,
-                "Phiên hiện tại": phien_id+1,
-                "Dự đoán":        pred,
-                "Độ tin cậy":     tin_cay,
-                "Pattern":        pattern_20,
-                "ID":             "tuananh"
-            })
+            # Dự đoán
+            du_doan, do_tin_cay = du_doan_ai()
+            _prev_pred = du_doan
 
-            # ── IN TERMINAL ──
             so=len(history); cur_val,cur_len=_cur_streak()
             td=stats["tong"]
             acc_s=f"{stats['dung']}/{td} ({stats['dung']/td*100:.1f}%)" if td else "Chưa có"
 
-            print("\n"+"="*46)
-            print(f"  Phiên         : {phien_id}")
-            print(f"  Xúc xắc      : {d1}  {d2}  {d3}")
-            print(f"  Tổng          : {tong}")
-            print(f"  Kết quả       : {ket_qua}")
-            print(f"  Chuỗi         : {cur_val} x{cur_len}" if cur_val else "  Chuỗi         : --")
-            print(f"  Bộ nhớ        : {so}/{MAX_PHIEN} phiên")
-            print("-"*46)
-            if pred=="Đang chờ":
-                print(f"  Dự đoán       : Chờ thêm {MIN_PHIEN-so} phiên...")
+            # JSON GIỮ NGUYÊN FORMAT GỐC
+            latest_data = {
+                "Phiên":          phien,
+                "Xúc xắc 1":      d1,
+                "Xúc xắc 2":      d2,
+                "Xúc xắc 3":      d3,
+                "Tổng":           tong,
+                "Kết":            ket,
+                "Phiên hiện tại": phien+1,
+                "Dự đoán":        du_doan,
+                "Độ tin cậy":     do_tin_cay,
+                "Pattern":        pattern,
+                "ID":             "tuananh"
+            }
+
+            
+            print("="*40)
+            print(f"Phiên   : {phien}")
+            print(f"Xúc xắc : {d1}  {d2}  {d3}")
+            print(f"Tổng    : {tong}  |  Kết: {ket}")
+            print(f"Chuỗi   : {cur_val} x{cur_len}" if cur_val else "Chuỗi   : --")
+            print(f"Bộ nhớ  : {so}/{MAX_PHIEN}")
+            print(f"Pattern : {pattern}")
+            if du_doan=="Chưa đủ dữ liệu":
+                print(f"Dự đoán : Chờ thêm {MIN_PHIEN-so} phiên...")
             else:
-                print(f"  Pattern 20    : {pattern_20}")
-                print(f"  Dự đoán P.{phien_id+1}: >>> {pred} <<<")
-                print(f"  Độ tin cậy    : {tin_cay}%")
-                print("-"*46)
-                print(f"  Đúng/Sai      : {stats['dung']}/{stats['sai']}  |  {acc_s}")
-                print(f"  Chuỗi đúng   : {stats['cd']} (max {stats['max_cd']})")
-                print(f"  Chuỗi sai    : {stats['cs']} (max {stats['max_cs']})")
-                print("-"*46)
-                print("  Accuracy 15 mô hình:")
-                for lbl,key in [
-                    ("Markov 1 ","m1"),("Markov 2 ","m2"),("Markov 3 ","m3"),
-                    ("Markov 4 ","m4"),("Markov 5 ","m5"),("N-Gram   ","ng"),
-                    ("Streak   ","sk"),("Point    ","pt"),("Freq-10  ","fr10"),
-                    ("Freq-20  ","fr20"),("Momentum ","mom"),("Repeat   ","rep"),
-                    ("Alternat ","alt"),("Cycle    ","cyc"),("Bayesian ","bay"),
-                ]:
-                    print(f"    {lbl}: {_acc_str(key)}")
-            print(f"  ID            : tuananh")
-            print("="*46)
+                print(f"Dự đoán : >>> {du_doan} <<<")
+                print(f"Tin cậy : {do_tin_cay}%")
+                print(f"Đúng/Sai: {stats['dung']}/{stats['sai']}  |  {acc_s}")
+            print("="*40)
+
+            last_phien = phien
 
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Lỗi:", e)
@@ -447,38 +398,32 @@ def fetch_data_loop():
 # ===============================
 # CHẠY THREAD
 # ===============================
-threading.Thread(target=fetch_data_loop, daemon=True).start()
+threading.Thread(target=fetch_loop, daemon=True).start()
 
 
 # ===============================
-# API (GIỮ NGUYÊN)
+# API
 # ===============================
 @app.route("/api/taixiumd5", methods=["GET"])
 def api_data():
     return jsonify({"data": latest_data})
 
 @app.route("/api/lichsu", methods=["GET"])
-def api_lich_su():
+def api_lichsu():
     td=stats["tong"]
     return jsonify({
-        "tong_du_doan":   td,
-        "dung":           stats["dung"],
-        "sai":            stats["sai"],
-        "ty_le_dung":     f"{stats['dung']/td*100:.1f}%" if td else "0%",
-        "chuoi_dung":     stats["cd"],
-        "chuoi_sai":      stats["cs"],
-        "max_chuoi_dung": stats["max_cd"],
-        "max_chuoi_sai":  stats["max_cs"],
-        "lich_su_20":     lich_su[-20:]
+        "tong":    td,
+        "dung":    stats["dung"],
+        "sai":     stats["sai"],
+        "ty_le":   f"{stats['dung']/td*100:.1f}%" if td else "0%",
+        "max_cd":  stats["max_cd"],
+        "max_cs":  stats["max_cs"],
+        "lich_su": lich_su[-20:]
     })
-
-@app.route("/", methods=["GET"])
-def home():
-    return "TOOL VIP PRO 5.0 – 15 AI"
 
 
 # ===============================
-# RUN SERVER
+# RUN
 # ===============================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
