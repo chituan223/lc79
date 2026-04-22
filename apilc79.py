@@ -10,8 +10,8 @@ from datetime import datetime
 # CẤU HÌNH
 # ===============================
 API_URL   = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-MAX_PHIEN = 25
-MIN_PHIEN = 20
+MAX_PHIEN = 100
+MIN_PHIEN = 50
 
 app = Flask(__name__)
 
