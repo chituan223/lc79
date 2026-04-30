@@ -2,211 +2,123 @@ import requests
 import time
 import threading
 import math
+import json
+import os
 from flask import Flask, jsonify
 from collections import deque, Counter
 from datetime import datetime
 
+app = Flask(__name__)
+
 # ===============================
-# CẤU HÌNH
+# CONFIG
 # ===============================
 API_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-MAX_PHIEN = 60
+MAX_PHIEN = 300
 MIN_PHIEN = 30
-
-app = Flask(__name__)
+DATA_FILE = "tele68_ai_data.json"
+WEIGHTS_FILE = "tele68_ai_weights.json"
 
 # ===============================
 # DATA
 # ===============================
-history_tx = deque(maxlen=MAX_PHIEN)   # Tài/Xỉu
-history_pt = deque(maxlen=MAX_PHIEN)   # Điểm
-history_id = deque(maxlen=MAX_PHIEN)   # ID phiên
-history_dice = deque(maxlen=MAX_PHIEN) # Chi tiết xúc xắc
+history_tx = deque(maxlen=MAX_PHIEN)
+history_pt = deque(maxlen=MAX_PHIEN)
+history_id = deque(maxlen=MAX_PHIEN)
+history_dice = deque(maxlen=MAX_PHIEN)
 
-# Stats theo dõi độ chính xác thật
-stats = {
-    "tong": 0, "dung": 0, "sai": 0,
-    "max_tai": 0, "max_xiu": 0,
-    "streak_tai": 0, "streak_xiu": 0
-}
-
-# Lưu dự đoán để đánh giá
-pred_log = deque(maxlen=MAX_PHIEN)  # {phien, prediction, actual, correct}
+stats = {"tong": 0, "dung": 0, "sai": 0, "max_tai": 0, "max_xiu": 0}
+pred_log = deque(maxlen=MAX_PHIEN)
 
 last_phien = None
 last_prediction = None
+_last_phien_processed = None
 
 latest_data = {
     "Phiên": None,
-    "Xúc xắc 1": None, "Xúc xắc 2": None, "Xúc xắc 3": None,
-    "Tổng": None, "Kết": None,
+    "Xúc xắc 1": None,
+    "Xúc xắc 2": None,
+    "Xúc xắc 3": None,
+    "Tổng": None,
+    "Kết": None,
     "Phiên hiện tại": None,
     "Dự đoán": "Khởi động...",
     "Độ tin cậy": 0,
     "Pattern": "",
-    "Tỷ lệ đúng": "0% (0/0)",
-    "Chuỗi hiện tại": "",
+    "Cầu": "",
     "Max chuỗi Tài": 0,
     "Max chuỗi Xỉu": 0,
+    "Tỷ lệ đúng": "0%",
     "AI Models": {},
+    "Trọng số": {},
     "Phân tích": "",
     "ID": "tuananh"
 }
 
 # ===============================
-# AI ENGINE - ĐA MÔ HÌNH
+# UTILS
 # ===============================
-
 def encode(tx_list):
-    """Chuyển Tài/Xỉu thành T/X"""
     return "".join(["T" if x == "Tài" else "X" for x in tx_list])
 
 def decode(c):
     return "Tài" if c == "T" else "Xỉu"
 
-# ---------- 1. MARKOV CHAIN ----------
-class MarkovChain:
-    def predict(self, tx_list, order=3):
-        if len(tx_list) < order + 5:
-            return None, 0
-        s = encode(tx_list)
-        transitions = {}
-        for i in range(len(s) - order):
-            state = s[i:i+order]
-            nxt = s[i+order]
-            if state not in transitions:
-                transitions[state] = Counter()
-            transitions[state][nxt] += 1
-        
-        current = s[-order:]
-        if current not in transitions:
-            return None, 0
-        
-        counts = transitions[current]
-        total = sum(counts.values())
-        prob_t = counts.get("T", 0) / total
-        prob_x = counts.get("X", 0) / total
-        
-        pred = "Tài" if prob_t > prob_x else "Xỉu"
-        conf = max(prob_t, prob_x) * 100
-        return pred, conf
-
-# ---------- 2. N-GRAM MODEL ----------
-class NGramModel:
-    def predict(self, tx_list, max_n=5):
-        if len(tx_list) < 10:
-            return None, 0
-        
-        s = encode(tx_list)
-        votes = Counter()
-        confidences = []
-        
-        for n in range(2, min(max_n + 1, len(s)//2)):
-            if len(s) < n + 2:
-                continue
-            grams = Counter()
-            for i in range(len(s) - n):
-                gram = s[i:i+n]
-                nxt = s[i+n]
-                grams[(gram, nxt)] += 1
-            
-            current = s[-n:]
-            t_score = sum(grams.get((current, "T"), 0) for _ in range(1))
-            x_score = sum(grams.get((current, "X"), 0) for _ in range(1))
-            
-            # Tính điểm thực
-            t_total = sum(v for (g, c), v in grams.items() if g == current and c == "T")
-            x_total = sum(v for (g, c), v in grams.items() if g == current and c == "X")
-            total = t_total + x_total
-            
-            if total > 0:
-                if t_total > x_total:
-                    votes["Tài"] += n  # N càng cao càng tin cậy
-                    confidences.append(t_total / total * 100)
-                elif x_total > t_total:
-                    votes["Xỉu"] += n
-                    confidences.append(x_total / total * 100)
-        
-        if not votes:
-            return None, 0
-        
-        pred = votes.most_common(1)[0][0]
-        avg_conf = sum(confidences) / len(confidences) if confidences else 50
-        return pred, min(avg_conf, 95)
-
-# ---------- 3. PATTERN DETECTION ----------
-class PatternModel:
-    def __init__(self):
-        self.patterns = {
-            "bệt": self._detect_streak,
-            "1-1": self._detect_alt,
-            "2-2": self._detect_double,
-            "3-3": self._detect_triple,
-            "cân_bằng": self._detect_balance,
-            "đảo_sau_bệt": self._detect_reversal_after_streak,
-            "lặp_chu_kỳ": self._detect_cycle
+def save_data():
+    try:
+        data = {
+            "history": list(history_tx),
+            "points": list(history_pt),
+            "ids": list(history_id),
+            "dice": [list(d) for d in history_dice],
+            "stats": stats,
+            "pred_log": list(pred_log)[-100:],
+            "last_phien": _last_phien_processed
         }
-    
-    def _detect_streak(self, s):
-        if len(s) < 3:
-            return None
-        last = s[-1]
-        count = 0
-        for c in reversed(s):
-            if c == last:
-                count += 1
-            else:
-                break
-        if count >= 3:
-            opposite = "X" if last == "T" else "T"
-            return decode(opposite), min(50 + count * 8, 90), f"Bệt {decode(last)} x{count}"
-        return None
-    
-    def _detect_alt(self, s):
-        if len(s) < 4:
-            return None
-        recent = s[-6:]
-        is_alt = all(recent[i] != recent[i+1] for i in range(len(recent)-1))
-        if is_alt:
-            next_c = "X" if recent[-1] == "T" else "T"
-            return decode(next_c), 75, "Cầu 1-1"
-        return None
-    
-    def _detect_double(self, s):
-        if len(s) < 6:
-            return None
-        recent = s[-8:]
-        for i in range(0, len(recent)-3, 2):
-            if not (recent[i]==recent[i+1] and recent[i+2]==recent[i+3] and recent[i]!=recent[i+2]):
-                return None
-        next_expected = recent[0] if len(recent) % 4 == 0 else recent[2]
-        return decode(next_expected), 80, "Cầu 2-2"
-    
-    def _detect_triple(self, s):
-        if len(s) < 9:
-            return None
-        recent = s[-12:]
-        for i in range(0, len(recent)-5, 3):
-            if not (recent[i]==recent[i+1]==recent[i+2] and recent[i+3]==recent[i+4]==recent[i+5] and recent[i]!=recent[i+3]):
-                return None
-        return decode(recent[0]), 85, "Cầu 3-3"
-    
-    def _detect_balance(self, s):
-        if len(s) < 20:
-            return None
-        recent = s[-20:]
-        t_count = recent.count("T")
-        t_pct = t_count / 20
-        if t_pct > 0.7:
-            return "Xỉu", min(50 + (t_pct-0.5)*100, 90), f"Tài thiên lệch {t_pct:.0%}"
-        elif t_pct < 0.3:
-            return "Tài", min(50 + (0.5-t_pct)*100, 90), f"Xỉu thiên lệch {1-t_pct:.0%}"
-        return None
-    
-    def _detect_reversal_after_streak(self, s):
-        if len(s) < 5:
-            return None
-        # Sau bệt 3+ thường đảo
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def load_data():
+    global _last_phien_processed
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+                for h, p, i, d in zip(data.get("history", [])[-100:],
+                                      data.get("points", [])[-100:],
+                                      data.get("ids", [])[-100:],
+                                      data.get("dice", [])[-100:]):
+                    history_tx.append(h)
+                    history_pt.append(p)
+                    history_id.append(i)
+                    history_dice.append(tuple(d))
+                saved_stats = data.get("stats", {})
+                for k in stats:
+                    if k in saved_stats:
+                        stats[k] = saved_stats[k]
+                saved_pred = data.get("pred_log", [])
+                pred_log.extend(saved_pred)
+                _last_phien_processed = data.get("last_phien")
+    except:
+        pass
+
+# ===============================
+# NHẬN DIỆN CẦU THÔNG MINH
+# ===============================
+
+class CauDetector:
+    @staticmethod
+    def detect(tx_list):
+        if len(tx_list) < 5:
+            return "Chưa đủ dữ liệu", []
+        
+        s = encode(tx_list)
+        n = len(s)
+        cau_list = []
+        
+        # 1. Cầu bệt
         streak = 0
         last = s[-1]
         for c in reversed(s):
@@ -215,215 +127,531 @@ class PatternModel:
             else:
                 break
         if streak >= 3:
-            opposite = "X" if last == "T" else "T"
-            return decode(opposite), 70, f"Đảo sau bệt {streak}"
-        return None
-    
-    def _detect_cycle(self, s):
-        if len(s) < 8:
-            return None
-        # Tìm chu kỳ lặp lại
-        for cycle_len in range(2, min(6, len(s)//2)):
-            cycle = s[-cycle_len:]
-            if s[-cycle_len*2:-cycle_len] == cycle:
-                next_in_cycle = cycle[0]
-                return decode(next_in_cycle), 80, f"Chu kỳ {cycle_len}"
-        return None
-    
-    def predict(self, tx_list):
-        s = encode(tx_list)
-        results = []
-        for name, detector in self.patterns.items():
-            result = detector(s)
-            if result:
-                pred, conf, reason = result
-                results.append((pred, conf, reason, name))
+            cau_list.append(f"Bệt {decode(last)} x{streak}")
         
-        if not results:
-            return None, 0, "Không nhận diện pattern"
+        # 2. Cầu 1-1
+        if n >= 6:
+            recent = s[-6:]
+            if all(recent[i] != recent[i+1] for i in range(5)):
+                cau_list.append("Cầu 1-1 (T-X-T-X-T-X)")
         
-        # Chọn pattern có độ tin cậy cao nhất
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[0][0], results[0][1], results[0][2]
+        # 3. Cầu 2-2
+        if n >= 8:
+            recent = s[-8:]
+            is22 = True
+            for i in range(0, 6, 2):
+                if not (recent[i]==recent[i+1] and recent[i+2]==recent[i+3] and recent[i]!=recent[i+2]):
+                    is22 = False
+                    break
+            if is22:
+                cau_list.append("Cầu 2-2 (TT-XX-TT-XX)")
+        
+        # 4. Cầu 3-3
+        if n >= 12:
+            recent = s[-12:]
+            is33 = True
+            for i in range(0, 9, 3):
+                if not (recent[i]==recent[i+1]==recent[i+2] and 
+                        recent[i+3]==recent[i+4]==recent[i+5] and 
+                        recent[i]!=recent[i+3]):
+                    is33 = False
+                    break
+            if is33:
+                cau_list.append("Cầu 3-3 (TTT-XXX-TTT-XXX)")
+        
+        # 5. Đảo sau bệt
+        if streak >= 3 and n >= streak + 2:
+            cau_list.append(f"Đảo sau bệt {streak}")
+        
+        # 6. Cân bằng
+        if n >= 20:
+            recent20 = s[-20:]
+            t_count = recent20.count("T")
+            if t_count >= 14:
+                cau_list.append(f"Tài thiên lệch {t_count}/20 -> chờ Xỉu")
+            elif t_count <= 6:
+                cau_list.append(f"Xỉu thiên lệch {20-t_count}/20 -> chờ Tài")
+        
+        # 7. Chu kỳ
+        if n >= 15:
+            for cycle in range(2, 8):
+                if n >= cycle * 3:
+                    recent = s[-cycle*3:]
+                    if all(recent[i] == recent[i+cycle] == recent[i+cycle*2] for i in range(cycle)):
+                        cau_list.append(f"Chu kỳ lặp {cycle}")
+                        break
+        
+        # 8. Bệt ngắn xen kẽ
+        if n >= 10:
+            recent10 = s[-10:]
+            streaks_short = []
+            cur = 1
+            for i in range(1, len(recent10)):
+                if recent10[i] == recent10[i-1]:
+                    cur += 1
+                else:
+                    streaks_short.append(cur)
+                    cur = 1
+            streaks_short.append(cur)
+            if all(x <= 2 for x in streaks_short[-5:]) and len(streaks_short) >= 5:
+                cau_list.append("Cầu ngắn xen kẽ (1-2)")
+        
+        if not cau_list:
+            return "Không nhận diện được cầu rõ ràng", []
+        
+        return " | ".join(cau_list), cau_list
 
-# ---------- 4. STREAK ANALYSIS ----------
+# ===============================
+# 20 AI MODELS
+# ===============================
+
+class MarkovChain:
+    def predict(self, tx_list, order=3):
+        if len(tx_list) < order + 5:
+            return None, 0
+        s = encode(tx_list)
+        trans = {}
+        for i in range(len(s) - order):
+            state = s[i:i+order]
+            trans.setdefault(state, Counter())[s[i+order]] += 1
+        cur = s[-order:]
+        if cur not in trans:
+            return None, 0
+        counts = trans[cur]
+        total = sum(counts.values())
+        if total < 2:
+            return None, 0
+        p_t = counts.get("T", 0) / total
+        pred = "Tài" if p_t > 0.5 else "Xỉu"
+        conf = max(p_t, 1-p_t) * 100
+        return pred, conf
+
+class NGramModel:
+    def predict(self, tx_list, max_n=5):
+        if len(tx_list) < 10:
+            return None, 0
+        s = encode(tx_list)
+        votes = Counter()
+        confs = []
+        for n in range(2, min(max_n+1, len(s)//2+1)):
+            if len(s) < n + 2:
+                continue
+            grams = Counter()
+            for i in range(len(s)-n):
+                grams[(s[i:i+n], s[i+n])] += 1
+            cur = s[-n:]
+            t_score = sum(v for (g,c),v in grams.items() if g==cur and c=="T")
+            x_score = sum(v for (g,c),v in grams.items() if g==cur and c=="X")
+            total = t_score + x_score
+            if total > 0:
+                if t_score > x_score:
+                    votes["Tài"] += n
+                    confs.append(t_score/total*100)
+                elif x_score > t_score:
+                    votes["Xỉu"] += n
+                    confs.append(x_score/total*100)
+        if not votes:
+            return None, 0
+        pred = votes.most_common(1)[0][0]
+        return pred, min(sum(confs)/len(confs) if confs else 50, 95)
+
+class PatternModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 5:
+            return None, 0
+        s = encode(tx_list)
+        n = len(s)
+        
+        streak = 0
+        last = s[-1]
+        for c in reversed(s):
+            if c == last:
+                streak += 1
+            else:
+                break
+        if streak >= 3:
+            opp = "X" if last == "T" else "T"
+            return decode(opp), min(50 + streak * 10, 90)
+        
+        if n >= 5:
+            recent = s[-5:]
+            if all(recent[i] != recent[i+1] for i in range(4)):
+                return decode("X" if recent[-1] == "T" else "T"), 80
+        
+        if n >= 20:
+            recent = s[-20:]
+            t_pct = recent.count("T") / 20
+            if t_pct >= 0.7:
+                return "Xỉu", min(50 + (t_pct-0.5)*100, 90)
+            elif t_pct <= 0.3:
+                return "Tài", min(50 + (0.5-t_pct)*100, 90)
+        
+        return None, 0
+
 class StreakModel:
     def predict(self, tx_list):
         if len(tx_list) < 10:
             return None, 0
-        
         s = encode(tx_list)
-        
-        # Phân tích độ dài chuỗi trung bình
         streaks = []
-        current = 1
+        cur = 1
         for i in range(1, len(s)):
             if s[i] == s[i-1]:
-                current += 1
+                cur += 1
             else:
-                streaks.append(current)
-                current = 1
-        streaks.append(current)
+                streaks.append(cur)
+                cur = 1
+        streaks.append(cur)
+        avg = sum(streaks) / len(streaks)
+        current = streaks[-1]
         
-        avg_streak = sum(streaks) / len(streaks)
-        current_streak = streaks[-1]
-        
-        # Nếu chuỗi hiện tại > trung bình + 1 -> đảo
-        if current_streak > avg_streak + 0.5:
-            opposite = "Xỉu" if s[-1] == "T" else "Tài"
-            conf = min(50 + (current_streak - avg_streak) * 15, 90)
-            return opposite, conf, f"Streak {current_streak} > avg {avg_streak:.1f}"
-        
-        # Nếu chuỗi ngắn -> tiếp tục
-        if current_streak <= avg_streak:
-            cont = decode(s[-1])
-            conf = min(50 + (avg_streak - current_streak) * 10, 85)
-            return cont, conf, f"Streak {current_streak} <= avg {avg_streak:.1f}"
-        
-        return None, 0, "Streak trung lập"
+        if current > avg + 0.5:
+            opp = "Xỉu" if s[-1] == "T" else "Tài"
+            return opp, min(50 + (current-avg)*20, 90)
+        elif current <= avg:
+            return decode(s[-1]), min(50 + (avg-current)*15, 85)
+        return None, 0
 
-# ---------- 5. REVERSAL DETECTION ----------
 class ReversalModel:
     def predict(self, tx_list):
         if len(tx_list) < 15:
             return None, 0
+        s = encode(tx_list)[-15:]
+        rev = sum(1 for i in range(1, len(s)) if s[i] != s[i-1])
+        rate = rev / (len(s)-1)
         
-        s = encode(tx_list)
-        
-        # Đếm số lần đảo trong 15 phiên gần nhất
-        recent = s[-15:]
-        reversals = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
-        reversal_rate = reversals / (len(recent) - 1)
-        
-        # Tỷ lệ đảo cao -> tiếp tục đảo
-        if reversal_rate > 0.6:
-            next_c = "X" if recent[-1] == "T" else "T"
-            return decode(next_c), min(50 + reversal_rate * 30, 85), f"Đảo cao {reversal_rate:.0%}"
-        
-        # Tỷ lệ đảo thấp -> tiếp tục trend
-        if reversal_rate < 0.3:
-            return decode(recent[-1]), min(50 + (0.3-reversal_rate)*100, 80), f"Ít đảo {reversal_rate:.0%}"
-        
-        return None, 0, f"Đảo trung bình {reversal_rate:.0%}"
+        if rate > 0.6:
+            return decode("X" if s[-1] == "T" else "T"), min(50 + rate*30, 85)
+        elif rate < 0.3:
+            return decode(s[-1]), min(50 + (0.3-rate)*100, 80)
+        return None, 0
 
-# ---------- 6. CYCLE PREDICTION ----------
 class CycleModel:
     def predict(self, tx_list):
         if len(tx_list) < 20:
             return None, 0
-        
         s = encode(tx_list)
-        
-        # Tìm chu kỳ bằng autocorrelation đơn giản
         best_cycle = None
         best_score = 0
         
-        for cycle in range(2, min(11, len(s)//2)):
-            matches = 0
-            total = 0
-            for i in range(cycle, len(s)):
-                if s[i] == s[i-cycle]:
-                    matches += 1
-                total += 1
-            
-            score = matches / total if total > 0 else 0
+        for c_len in range(2, min(10, len(s)//2)):
+            matches = sum(1 for i in range(c_len, len(s)) if s[i] == s[i-c_len])
+            score = matches / (len(s)-c_len)
             if score > best_score and score > 0.55:
                 best_score = score
-                best_cycle = cycle
+                best_cycle = c_len
         
         if best_cycle:
-            predicted = s[-best_cycle]
-            conf = min(score * 100, 90)
-            return decode(predicted), conf, f"Chu kỳ {best_cycle} ({best_score:.0%})"
-        
-        return None, 0, "Không có chu kỳ rõ ràng"
+            return decode(s[-best_cycle]), min(best_score*100, 90)
+        return None, 0
 
-# ---------- 7. MOMENTUM MODEL ----------
 class MomentumModel:
     def predict(self, tx_list):
         if len(tx_list) < 10:
             return None, 0
-        
         s = encode(tx_list)
-        
-        # Tính momentum theo các cửa sổ
-        windows = [5, 10, 15]
         momentums = []
-        
-        for w in windows:
+        for w in [5, 10, 15]:
             if len(s) >= w:
-                recent = s[-w:]
-                t_pct = recent.count("T") / w
+                t_pct = s[-w:].count("T") / w
                 momentums.append(t_pct)
         
         if not momentums:
             return None, 0
+        avg = sum(momentums) / len(momentums)
         
-        avg_momentum = sum(momentums) / len(momentums)
-        
-        # Momentum > 0.6 -> Tài mạnh
-        if avg_momentum > 0.6:
-            return "Tài", min(avg_momentum * 100, 90), f"Momentum Tài {avg_momentum:.0%}"
-        elif avg_momentum < 0.4:
-            return "Xỉu", min((1-avg_momentum) * 100, 90), f"Momentum Xỉu {1-avg_momentum:.0%}"
-        
-        return None, 0, f"Momentum trung lập {avg_momentum:.0%}"
+        if avg > 0.6:
+            return "Tài", min(avg*100, 90)
+        elif avg < 0.4:
+            return "Xỉu", min((1-avg)*100, 90)
+        return None, 0
 
-# ---------- 8. TREND STRENGTH ----------
-class TrendStrengthModel:
+class TrendModel:
     def predict(self, tx_list):
         if len(tx_list) < 15:
             return None, 0
-        
         s = encode(tx_list)
-        
-        # So sánh 2 nửa
         half = len(s) // 2
-        first_half = s[:half].count("T") / half if half > 0 else 0.5
-        second_half = s[half:].count("T") / (len(s)-half) if len(s)-half > 0 else 0.5
+        f = s[:half].count("T") / half if half else 0.5
+        se = s[half:].count("T") / (len(s)-half) if len(s)-half else 0.5
+        diff = abs(se - f)
         
-        trend_diff = abs(second_half - first_half)
-        
-        if trend_diff > 0.15:
-            # Trend mạnh -> tiếp tục
-            if second_half > first_half:
-                return "Tài", min(50 + trend_diff * 200, 85), f"Trend Tài mạnh"
-            else:
-                return "Xỉu", min(50 + trend_diff * 200, 85), f"Trend Xỉu mạnh"
-        
-        return None, 0, f"Trend yếu {trend_diff:.0%}"
+        if diff > 0.15:
+            return ("Tài" if se > f else "Xỉu"), min(50 + diff*200, 85)
+        return None, 0
 
-# ---------- 9. MOVING AVERAGE ----------
-class MovingAverageModel:
+class MAModel:
     def predict(self, tx_list):
         if len(tx_list) < 20:
             return None, 0
+        v = [1 if x == "Tài" else 0 for x in tx_list]
+        ma5 = sum(v[-5:]) / 5
+        ma10 = sum(v[-10:]) / 10
+        ma20 = sum(v[-20:]) / 20 if len(v) >= 20 else ma10
         
-        # Chuyển Tài=1, Xỉu=0 rồi tính MA
-        values = [1 if x == "Tài" else 0 for x in tx_list]
-        
-        ma5 = sum(values[-5:]) / 5
-        ma10 = sum(values[-10:]) / 10
-        ma20 = sum(values[-20:]) / 20 if len(values) >= 20 else ma10
-        
-        # Golden cross / Death cross đơn giản
         if ma5 > ma10 > ma20:
-            return "Tài", 75, "MA Bullish"
+            return "Tài", 78
         elif ma5 < ma10 < ma20:
-            return "Xỉu", 75, "MA Bearish"
+            return "Xỉu", 78
         
-        # MA5 cắt lên
-        if len(values) >= 6:
-            prev_ma5 = sum(values[-6:-1]) / 5
-            if ma5 > prev_ma5 and ma5 > 0.5:
-                return "Tài", 70, "MA5 tăng"
-            elif ma5 < prev_ma5 and ma5 < 0.5:
-                return "Xỉu", 70, "MA5 giảm"
-        
-        return None, 0, f"MA5={ma5:.2f} MA10={ma10:.2f}"
+        if len(v) >= 6:
+            pma5 = sum(v[-6:-1]) / 5
+            if ma5 > pma5 and ma5 > 0.5:
+                return "Tài", 72
+            elif ma5 < pma5 and ma5 < 0.5:
+                return "Xỉu", 72
+        return None, 0
 
-# ---------- 10. ENSEMBLE LEARNING ----------
-class EnsembleModel:
+class BayesianModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 20:
+            return None, 0
+        s = encode(tx_list)
+        prior_t = s.count("T") / len(s)
+        recent5 = s[-5:]
+        t5 = recent5.count("T")
+        
+        if t5 >= 4:
+            return "Xỉu", 70
+        elif t5 <= 1:
+            return "Tài", 70
+        return None, 0
+
+class EntropyModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 20:
+            return None, 0
+        s = encode(tx_list)[-20:]
+        t = s.count("T")
+        x = len(s) - t
+        if t == 0 or x == 0:
+            return decode("X" if s[-1] == "T" else "T"), 75
+        
+        p_t = t / len(s)
+        p_x = 1 - p_t
+        entropy = -(p_t*math.log2(p_t) + p_x*math.log2(p_x))
+        
+        if entropy < 0.7:
+            return decode(s[-1]), 75
+        elif entropy > 0.95:
+            return decode("X" if s[-1] == "T" else "T"), 60
+        return None, 0
+
+class MarkovHighOrder:
+    def predict(self, tx_list):
+        if len(tx_list) < 25:
+            return None, 0
+        s = encode(tx_list)
+        best_pred = None
+        best_conf = 0
+        
+        for order in [2, 3, 4, 5]:
+            if len(s) < order + 5:
+                continue
+            trans = {}
+            for i in range(len(s)-order):
+                state = s[i:i+order]
+                trans.setdefault(state, Counter())[s[i+order]] += 1
+            cur = s[-order:]
+            if cur not in trans:
+                continue
+            counts = trans[cur]
+            total = sum(counts.values())
+            if total < 3:
+                continue
+            p_t = counts.get("T", 0) / total
+            conf = max(p_t, 1-p_t) * 100
+            if conf > best_conf:
+                best_conf = conf
+                best_pred = "Tài" if p_t > 0.5 else "Xỉu"
+        
+        if best_pred and best_conf >= 55:
+            return best_pred, min(best_conf, 95)
+        return None, 0
+
+class RegressionModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 25:
+            return None, 0
+        v = [1 if x == "Tài" else 0 for x in tx_list[-20:]]
+        n = len(v)
+        sum_x = sum(range(n))
+        sum_y = sum(v)
+        sum_xy = sum(i*v[i] for i in range(n))
+        sum_x2 = sum(i*i for i in range(n))
+        denom = n*sum_x2 - sum_x*sum_x
+        if denom == 0:
+            return None, 0
+        slope = (n*sum_xy - sum_x*sum_y) / denom
+        
+        if slope > 0.05:
+            return "Tài", min(50+slope*500, 85)
+        elif slope < -0.05:
+            return "Xỉu", min(50+abs(slope)*500, 85)
+        return None, 0
+
+class FreqAdaptiveModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 30:
+            return None, 0
+        s = encode(tx_list)
+        signals = []
+        for w in [10, 20, 30]:
+            if len(s) < w:
+                continue
+            t_pct = s[-w:].count("T") / w
+            if t_pct > 0.65:
+                signals.append(("Xỉu", t_pct))
+            elif t_pct < 0.35:
+                signals.append(("Tài", t_pct))
+        
+        if not signals:
+            return None, 0
+        signals.sort(key=lambda x: x[1], reverse=True)
+        pred, conf = signals[0]
+        return pred, min(conf*100, 90)
+
+class DeepPatternModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 25:
+            return None, 0
+        s = encode(tx_list)
+        
+        for pat_len in range(3, min(7, len(s)//3)):
+            for gap in range(1, min(5, (len(s)-pat_len)//2)):
+                matches = 0
+                total = 0
+                for i in range(len(s)-pat_len-gap):
+                    if s[i:i+pat_len] == s[i+gap:i+gap+pat_len]:
+                        matches += 1
+                    total += 1
+                score = matches/total if total else 0
+                if score > 0.6:
+                    recent = s[-pat_len:]
+                    for i in range(len(s)-pat_len-gap, -1, -1):
+                        if s[i:i+pat_len] == recent and i+pat_len+gap < len(s):
+                            return decode(s[i+pat_len+gap]), min(score*100, 90)
+        
+        for length in range(4, min(8, len(s)//2)):
+            sub = s[-length:]
+            positions = [i for i in range(len(s)-length) if s[i:i+length] == sub]
+            if len(positions) >= 2:
+                next_chars = [s[p+length] for p in positions if p+length < len(s)]
+                if next_chars:
+                    t_count = next_chars.count("T")
+                    pred = "Tài" if t_count > len(next_chars)/2 else "Xỉu"
+                    conf = max(t_count, len(next_chars)-t_count) / len(next_chars) * 100
+                    return pred, min(conf, 90)
+        return None, 0
+
+class FibonacciModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 8:
+            return None, 0
+        s = encode(tx_list)
+        streak = 0
+        last = s[-1]
+        for c in reversed(s):
+            if c == last:
+                streak += 1
+            else:
+                break
+        
+        fib_streaks = [2, 3, 5, 8, 13]
+        if streak in fib_streaks:
+            opp = "X" if last == "T" else "T"
+            return decode(opp), 70
+        return None, 0
+
+class GoldenRatioModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 30:
+            return None, 0
+        s = encode(tx_list)
+        phi = int(len(s) / 1.618)
+        recent_phi = s[-phi:].count("T") / phi if phi else 0.5
+        
+        if recent_phi > 0.65:
+            return "Xỉu", 70
+        elif recent_phi < 0.35:
+            return "Tài", 70
+        return None, 0
+
+class VolatilityModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 15:
+            return None, 0
+        s = encode(tx_list)[-15:]
+        changes = sum(1 for i in range(1, len(s)) if s[i] != s[i-1])
+        vol = changes / (len(s)-1)
+        
+        if vol > 0.7:
+            return decode("X" if s[-1] == "T" else "T"), 68
+        elif vol < 0.2:
+            return decode(s[-1]), 68
+        return None, 0
+
+class SupportResistanceModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 20:
+            return None, 0
+        s = encode(tx_list)
+        streaks = []
+        cur = 1
+        for i in range(1, len(s)):
+            if s[i] == s[i-1]:
+                cur += 1
+            else:
+                streaks.append((cur, s[i-1]))
+                cur = 1
+        streaks.append((cur, s[-1]))
+        
+        if len(streaks) >= 2 and streaks[-2][0] >= 4:
+            return decode(streaks[-1][1]), 75
+        return None, 0
+
+class TimeSeriesModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 15:
+            return None, 0
+        v = [1 if x == "Tài" else 0 for x in tx_list[-15:]]
+        alpha = 0.3
+        smoothed = v[0]
+        for val in v[1:]:
+            smoothed = alpha * val + (1-alpha) * smoothed
+        
+        if smoothed > 0.58:
+            return "Tài", 70
+        elif smoothed < 0.42:
+            return "Xỉu", 70
+        return None, 0
+
+class ClusteringModel:
+    def predict(self, tx_list):
+        if len(tx_list) < 25:
+            return None, 0
+        s = encode(tx_list)
+        recent8 = s[-8:]
+        
+        best_score = 0
+        best_match = None
+        for i in range(len(s)-16):
+            segment = s[i:i+8]
+            score = sum(a==b for a,b in zip(recent8, segment)) / 8
+            if score > best_score and score > 0.75:
+                best_score = score
+                if i+8 < len(s):
+                    best_match = s[i+8]
+        
+        if best_match:
+            return decode(best_match), min(best_score*100, 85)
+        return None, 0
+
+# ===============================
+# ENSEMBLE
+# ===============================
+
+class SuperEnsemble:
     def __init__(self):
         self.models = {
             "Markov": MarkovChain(),
@@ -433,103 +661,189 @@ class EnsembleModel:
             "Reversal": ReversalModel(),
             "Cycle": CycleModel(),
             "Momentum": MomentumModel(),
-            "Trend": TrendStrengthModel(),
-            "MA": MovingAverageModel()
+            "Trend": TrendModel(),
+            "MA": MAModel(),
+            "Bayes": BayesianModel(),
+            "Entropy": EntropyModel(),
+            "MarkovHO": MarkovHighOrder(),
+            "Regression": RegressionModel(),
+            "FreqAdapt": FreqAdaptiveModel(),
+            "DeepPattern": DeepPatternModel(),
+            "Fibonacci": FibonacciModel(),
+            "GoldenRatio": GoldenRatioModel(),
+            "Volatility": VolatilityModel(),
+            "SupportResist": SupportResistanceModel(),
+            "TimeSeries": TimeSeriesModel(),
+            "Clustering": ClusteringModel()
         }
+        self.weights = {name: 1.0 for name in self.models}
+        self.performance = {name: {"dung": 0, "sai": 0} for name in self.models}
+        self.load_weights()
+    
+    def load_weights(self):
+        try:
+            if os.path.exists(WEIGHTS_FILE):
+                with open(WEIGHTS_FILE, "r") as f:
+                    data = json.load(f)
+                    for k, v in data.get("weights", {}).items():
+                        if k in self.weights:
+                            self.weights[k] = v
+                    perf = data.get("performance", {})
+                    for k, v in perf.items():
+                        if k in self.performance:
+                            self.performance[k] = v
+        except:
+            pass
+    
+    def save_weights(self):
+        try:
+            with open(WEIGHTS_FILE, "w") as f:
+                json.dump({"weights": self.weights, "performance": self.performance}, f)
+        except:
+            pass
+    
+    def update(self, actual, tx_list_before):
+        if len(tx_list_before) < 5:
+            return
+        for name, model in self.models.items():
+            try:
+                result = model.predict(list(tx_list_before))
+                if result and len(result) >= 2 and result[0]:
+                    pred = result[0]
+                    if pred == actual:
+                        self.performance[name]["dung"] += 1
+                        self.weights[name] = min(self.weights[name] * 1.08, 5.0)
+                    else:
+                        self.performance[name]["sai"] += 1
+                        self.weights[name] = max(self.weights[name] * 0.92, 0.2)
+            except:
+                pass
+        self.save_weights()
     
     def predict(self, tx_list):
         votes = Counter()
-        confidences = {}
+        details = {}
         reasons = {}
+        active_models = 0
         
         for name, model in self.models.items():
             try:
-                pred, conf, reason = model.predict(tx_list)
-                if pred:
-                    votes[pred] += conf  # Weighted voting
-                    confidences[name] = round(conf, 1)
-                    reasons[name] = reason
+                result = model.predict(tx_list)
+                if result and len(result) >= 2 and result[0]:
+                    pred, conf = result[0], result[1]
+                    if conf >= 55:
+                        weight = self.weights.get(name, 1.0)
+                        votes[pred] += conf * weight
+                        details[name] = round(conf, 1)
+                        reasons[name] = f"{name}:{conf:.0f}%"
+                        active_models += 1
             except:
-                continue
+                pass
         
         if not votes:
-            # Fallback: đảo cầu
             if tx_list:
-                fallback = "Xỉu" if tx_list[-1] == "Tài" else "Tài"
-                return fallback, 50, {"Fallback": "Đảo cầu"}, "Không có tín hiệu - đảo"
-            return "Tài", 50, {}, "Mặc định"
+                s = encode(tx_list)
+                streak = 0
+                last = s[-1]
+                for c in reversed(s):
+                    if c == last:
+                        streak += 1
+                    else:
+                        break
+                if streak >= 2:
+                    fallback = "Xỉu" if tx_list[-1] == "Tài" else "Tài"
+                    return fallback, 52, {}, {}, "Fallback đảo cầu"
+                return decode(s[-1]), 52, {}, {}, "Fallback tiếp trend"
+            return "Tài", 50, {}, {}, "Mặc định"
         
-        # Chọn winner
         winner = votes.most_common(1)[0]
         pred = winner[0]
-        total_conf = winner[1]
-        avg_conf = min(total_conf / sum(votes.values()) * 100, 95) if sum(votes.values()) > 0 else 50
+        total = sum(votes.values())
+        conf = min(winner[1]/total*100, 95) if total else 50
         
-        return pred, round(avg_conf, 1), confidences, " | ".join([f"{k}:{v}" for k,v in reasons.items()])
-
-# ---------- 11. ADAPTIVE WEIGHT ----------
-class AdaptiveWeightModel:
-    def __init__(self):
-        self.model = EnsembleModel()
-        self.weights = {name: 1.0 for name in self.model.models.keys()}
-        self.performance = {name: {"dung": 0, "sai": 0} for name in self.model.models.keys()}
-    
-    def update_weights(self, prediction, actual, model_outputs):
-        """Điều chỉnh trọng số dựa trên kết quả thực tế"""
-        for name, pred in model_outputs.items():
-            if pred == actual:
-                self.performance[name]["dung"] += 1
-                self.weights[name] = min(self.weights[name] * 1.05, 3.0)
-            else:
-                self.performance[name]["sai"] += 1
-                self.weights[name] = max(self.weights[name] * 0.95, 0.3)
-    
-    def predict(self, tx_list):
-        pred, conf, model_confs, reason = self.model.predict(tx_list)
-        return pred, conf, model_confs, reason, self.weights.copy()
+        top = sorted([(k, v) for k, v in reasons.items()],
+                    key=lambda x: self.weights.get(x[0].split(":")[0], 1), reverse=True)[:5]
+        reason_str = " | ".join([v for k, v in top])
+        
+        return pred, round(conf, 1), details, self.weights.copy(), reason_str
 
 # Khởi tạo AI
-ai_engine = AdaptiveWeightModel()
+ai_engine = SuperEnsemble()
+load_data()
+
+# ===============================
+# PREDICT
+# ===============================
+def predict_ai(tx_list):
+    if len(tx_list) < MIN_PHIEN:
+        return "Chờ dữ liệu...", 0, {}, {}, f"Cần {MIN_PHIEN} phiên, hiện có {len(tx_list)}"
+    pred, conf, details, weights, reason = ai_engine.predict(tx_list)
+    return pred, conf, details, weights, reason
 
 # ===============================
 # FETCH DATA
 # ===============================
-
 def fetch_loop():
-    global last_phien, last_prediction, stats, latest_data
-    
+    global last_phien, latest_data, last_prediction, _last_phien_processed
+
     while True:
         try:
             res = requests.get(API_URL, timeout=5)
             data = res.json()
             ds = data.get("list", [])
+
             if not ds:
                 time.sleep(2)
                 continue
-            
+
             item = ds[0]
             phien = item.get("id")
-            
-            if phien == last_phien:
+
+            # FIX: Kiểm tra trùng phiên
+            if phien == last_phien or phien == _last_phien_processed:
                 time.sleep(2)
                 continue
-            
+
             d1, d2, d3 = item.get("dices")
             tong = item.get("point")
             ket = "Tài" if tong >= 11 else "Xỉu"
-            
+
+            # Huấn luyện AI trước khi thêm phiên mới
+            if len(history_tx) >= MIN_PHIEN and last_prediction and last_prediction not in ["Khởi động...", "Chờ dữ liệu..."]:
+                ai_engine.update(ket, list(history_tx))
+
+            # Update stats
+            if last_prediction is not None and last_prediction not in ["Khởi động...", "Chờ dữ liệu..."]:
+                stats["tong"] += 1
+                correct = (last_prediction == ket)
+                if correct:
+                    stats["dung"] += 1
+                else:
+                    stats["sai"] += 1
+
+                pred_log.append({
+                    "phien": phien,
+                    "prediction": last_prediction,
+                    "actual": ket,
+                    "correct": correct,
+                    "time": datetime.now().strftime("%H:%M:%S")
+                })
+
             # Lưu lịch sử
             history_tx.append(ket)
             history_pt.append(tong)
             history_id.append(phien)
             history_dice.append((d1, d2, d3))
-            
-            # Tính chuỗi
-            s = encode(list(history_tx))
+
+            # Đánh dấu phiên đã xử lý
+            _last_phien_processed = phien
+            last_phien = phien
+
+            # Tính max chuỗi
             max_tai = max_xiu = 0
             cur_tai = cur_xiu = 0
-            for c in s:
-                if c == "T":
+            for x in history_tx:
+                if x == "Tài":
                     cur_tai += 1
                     cur_xiu = 0
                     max_tai = max(max_tai, cur_tai)
@@ -537,11 +851,12 @@ def fetch_loop():
                     cur_xiu += 1
                     cur_tai = 0
                     max_xiu = max(max_xiu, cur_xiu)
-            
+
             stats["max_tai"] = max_tai
             stats["max_xiu"] = max_xiu
-            
+
             # Tính chuỗi hiện tại
+            s = encode(list(history_tx))
             current_streak = 0
             current_type = None
             if s:
@@ -551,42 +866,22 @@ def fetch_loop():
                         current_streak += 1
                     else:
                         break
-            
-            # Kiểm tra dự đoán trước
-            if last_prediction is not None and len(history_tx) > 1:
-                stats["tong"] += 1
-                correct = (last_prediction == ket)
-                if correct:
-                    stats["dung"] += 1
-                else:
-                    stats["sai"] += 1
-                
-                pred_log.append({
-                    "phien": phien,
-                    "prediction": last_prediction,
-                    "actual": ket,
-                    "correct": correct
-                })
-            
-            # AI DỰ ĐOÁN
+
+            # Nhận diện cầu
+            cau_text, cau_list = CauDetector.detect(list(history_tx))
+
+            # AI Predict
             tx_list = list(history_tx)
-            if len(tx_list) >= MIN_PHIEN:
-                du_doan, do_tin_cay, model_confs, phan_tich, weights = ai_engine.predict(tx_list)
-            else:
-                du_doan = "Xỉu" if ket == "Tài" else "Tài"  # Đảo cầu ban đầu
-                do_tin_cay = 50
-                model_confs = {}
-                phan_tich = f"Chờ thêm {MIN_PHIEN - len(tx_list)} phiên"
-                weights = {}
-            
+            du_doan, do_tin_cay, model_confs, weights, phan_tich = predict_ai(tx_list)
             last_prediction = du_doan
-            
+
             # Pattern
-            pattern = s[-20:] if len(s) >= 20 else s
-            
+            pattern = s[-25:] if len(s) >= 25 else s
+
             # Tỷ lệ thật
-            ty_le = round(stats["dung"] / max(stats["tong"], 1) * 100, 1) if stats["tong"] > 0 else 0
-            
+            td = stats["tong"]
+            ty_le = f"{stats['dung']/td*100:.1f}%" if td else "0%"
+
             latest_data = {
                 "Phiên": phien,
                 "Xúc xắc 1": d1,
@@ -598,32 +893,52 @@ def fetch_loop():
                 "Dự đoán": du_doan,
                 "Độ tin cậy": do_tin_cay,
                 "Pattern": pattern,
+                "Cầu": cau_text,
+                "Chi tiết cầu": cau_list,
+                "Chuỗi hiện tại": f"{current_type} x{current_streak}" if current_type else "N/A",
                 "Max chuỗi Tài": max_tai,
                 "Max chuỗi Xỉu": max_xiu,
+                "Tỷ lệ đúng": ty_le,
+                "Thống kê": f"Đúng:{stats['dung']} Sai:{stats['sai']} Tổng:{td}",
                 "AI Models": model_confs,
                 "Trọng số": {k: round(v, 2) for k, v in weights.items()},
                 "Phân tích": phan_tich,
+                "Số phiên học": len(tx_list),
                 "ID": "tuananh"
             }
-            
-            
-            
-            last_phien = phien
-            
+
+            # Save data
+            save_data()
+
+            # Log
+            print("\n" + "=" * 75)
+            print(f"🎲 PHIÊN {phien} | {d1}-{d2}-{d3} = {tong} [{ket}]")
+            print("-" * 75)
+            print(f"Pattern  : {pattern}")
+            print(f"Cầu      : {cau_text}")
+            print(f"Chuỗi    : {current_type} x{current_streak}" if current_type else "Chuỗi    : N/A")
+            print(f"🔮 Dự đoán: >>> {du_doan} <<< ({do_tin_cay}%)")
+            print(f"📊 Tỷ lệ  : {ty_le} ({stats['dung']}/{td})")
+            print(f"🧠 Phân tích: {phan_tich}")
+            if model_confs:
+                active = {k: v for k, v in model_confs.items() if v > 0}
+                print(f"🤖 AI ({len(active)}/20 models): {active}")
+            print("=" * 75)
+
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Lỗi: {e}")
-        
+
         time.sleep(2)
+
 
 # ===============================
 # API
 # ===============================
-
-@app.route("/api/taixiumd5", methods=["GET"])
+@app.route("/api/taixiumd5")
 def api_data():
     return jsonify(latest_data)
 
-@app.route("/api/lichsu", methods=["GET"])
+@app.route("/api/lichsu")
 def api_lichsu():
     ls = []
     for i in range(-min(20, len(history_id)), 0):
@@ -633,21 +948,39 @@ def api_lichsu():
             "kết_quả": history_tx[idx],
             "tổng": history_pt[idx]
         })
-    
-    recent_pred = list(pred_log)[-20:]
-    
+
+    td = stats["tong"]
     return jsonify({
         "tổng_quan": {
-            "đã_quan_sát": stats["tong"],
+            "đã_quan_sát": td,
             "đúng": stats["dung"],
             "sai": stats["sai"],
-            "tỷ_lệ": latest_data.get("Tỷ lệ đúng", "0%"),
+            "tỷ_lệ": f"{stats['dung']/td*100:.1f}%" if td else "0%",
             "max_tai": stats["max_tai"],
             "max_xiu": stats["max_xiu"]
         },
-        "lịch_sử_dự_đoán": recent_pred,
-        "lịch_sử_20_phiên": ls
+        "lịch_sử_dự_đoán": list(pred_log)[-30:],
+        "lịch_sử_dự_đoán_đầy_đủ": list(pred_log)[-100:],
+        "lịch_sử_20_phiên": ls,
+        "ai_weights": {k: round(v, 2) for k, v in ai_engine.weights.items()},
+        "ai_performance": ai_engine.performance
     })
+
+@app.route("/api/cau")
+def api_cau():
+    tx_list = list(history_tx)
+    cau_text, cau_list = CauDetector.detect(tx_list)
+    return jsonify({
+        "cau": cau_text,
+        "chi_tiết": cau_list,
+        "số_phiên_phân_tích": len(tx_list),
+        "pattern": encode(tx_list)[-30:] if len(tx_list) >= 30 else encode(tx_list)
+    })
+
+@app.route("/")
+def home():
+    return jsonify({"status": "ok", "data": latest_data})
+
 
 # ===============================
 # RUN
