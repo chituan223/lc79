@@ -14,7 +14,7 @@ app = Flask(__name__)
 # CONFIG
 # ===============================
 API_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-MAX_PHIEN = 30
+MAX_PHIEN = 50
 MIN_PHIEN = 20
 DATA_FILE = "tele68_ai_data.json"
 WEIGHTS_FILE = "tele68_ai_weights.json"
