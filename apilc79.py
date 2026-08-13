@@ -11,8 +11,8 @@ from datetime import datetime
 app = Flask(__name__)
 
 API_URL = "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
-MAX_PHIEN = 300
-MIN_PHIEN = 20
+MAX_PHIEN = 20
+MIN_PHIEN = 1
 DATA_FILE = "betvip_vip_data.json"
 WEIGHTS_FILE = "betvip_vip_weights.json"
 
